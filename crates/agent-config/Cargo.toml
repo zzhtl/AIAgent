@@ -1,0 +1,16 @@
+[package]
+name = "agent-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Layered TOML + env configuration loader for the agent runtime."
+
+[dependencies]
+agent-core = { workspace = true }
+serde      = { workspace = true }
+figment    = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }

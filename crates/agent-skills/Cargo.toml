@@ -1,0 +1,18 @@
+[package]
+name = "agent-skills"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Skill and Rule loading: markdown-based capability packs injected into prompts."
+
+[dependencies]
+agent-core     = { workspace = true }
+serde          = { workspace = true }
+thiserror      = { workspace = true }
+pulldown-cmark = { workspace = true }
+gray_matter    = { workspace = true }
+regex          = { workspace = true }
+tracing        = { workspace = true }

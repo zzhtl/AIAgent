@@ -1,0 +1,71 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agent-core",
+    "crates/agent-llm",
+    "crates/agent-tools",
+    "crates/agent-skills",
+    "crates/agent-memory",
+    "crates/agent-config",
+    "crates/agent-telemetry",
+    "apps/agent-cli",
+    "apps/agent-bot",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["zzhtl"]
+repository = "https://github.com/zzhtl/AIAgent"
+
+[workspace.dependencies]
+# 内部 crate 互相引用（路径依赖）
+agent-core      = { path = "crates/agent-core" }
+agent-llm       = { path = "crates/agent-llm" }
+agent-tools     = { path = "crates/agent-tools" }
+agent-skills    = { path = "crates/agent-skills" }
+agent-memory    = { path = "crates/agent-memory" }
+agent-config    = { path = "crates/agent-config" }
+agent-telemetry = { path = "crates/agent-telemetry" }
+
+# 异步运行时与流
+tokio        = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+futures      = "0.3"
+async-stream = "0.3"
+async-trait  = "0.1"
+
+# HTTP / 序列化
+reqwest    = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml       = "0.8"
+
+# 配置 / 错误 / 日志
+figment            = { version = "0.10", features = ["toml", "env"] }
+thiserror          = "1"
+anyhow             = "1"
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# CLI 与 REPL
+clap      = { version = "4", features = ["derive"] }
+rustyline = "14"
+crossterm = "0.28"
+
+# 存储
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "sqlite", "macros", "migrate", "chrono"] }
+
+# 文本处理
+pulldown-cmark = "0.12"
+gray_matter    = "0.2"
+regex          = "1"
+
+# 工具相关
+glob = "0.3"
+
+# 测试
+mockall  = "0.13"
+wiremock = "0.6"
