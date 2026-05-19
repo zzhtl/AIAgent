@@ -9,12 +9,14 @@ repository.workspace = true
 description = "LLM provider abstraction and concrete clients (OpenAI / DeepSeek / Anthropic)."
 
 [dependencies]
-agent-core  = { workspace = true }
-serde       = { workspace = true }
-serde_json  = { workspace = true }
-thiserror   = { workspace = true }
-async-trait = { workspace = true }
-futures     = { workspace = true }
-reqwest     = { workspace = true }
-tokio       = { workspace = true }
-tracing     = { workspace = true }
+agent-core   = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
+async-trait  = { workspace = true }
+futures      = { workspace = true }
+reqwest      = { workspace = true }
+tokio        = { workspace = true }
+tracing      = { workspace = true }
+async-stream = { workspace = true }
+bytes        = "1"

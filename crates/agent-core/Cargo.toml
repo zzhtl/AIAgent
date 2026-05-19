@@ -9,10 +9,12 @@ repository.workspace = true
 description = "AI Agent runtime core: messages, agent loop, channel abstraction."
 
 [dependencies]
-serde       = { workspace = true }
-serde_json  = { workspace = true }
-thiserror   = { workspace = true }
-async-trait = { workspace = true }
-futures     = { workspace = true }
-tokio       = { workspace = true }
-tracing     = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+thiserror    = { workspace = true }
+async-trait  = { workspace = true }
+async-stream = { workspace = true }
+futures      = { workspace = true }
+tokio        = { workspace = true }
+tracing      = { workspace = true }
+uuid         = { version = "1", features = ["v4", "serde"] }

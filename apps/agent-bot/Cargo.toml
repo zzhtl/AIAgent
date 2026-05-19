@@ -13,7 +13,15 @@ name = "agent-bot"
 path = "src/main.rs"
 
 [dependencies]
-agent-core = { workspace = true }
-anyhow     = { workspace = true }
-tokio      = { workspace = true }
-tracing    = { workspace = true }
+agent-core      = { workspace = true }
+agent-llm       = { workspace = true }
+agent-tools     = { workspace = true }
+agent-skills    = { workspace = true }
+agent-memory    = { workspace = true }
+agent-telemetry = { workspace = true }
+anyhow          = { workspace = true }
+tokio           = { workspace = true }
+tracing         = { workspace = true }
+futures         = { workspace = true }
+serde           = { workspace = true }
+serde_json      = { workspace = true }

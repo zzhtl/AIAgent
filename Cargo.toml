@@ -6,6 +6,7 @@ members = [
     "crates/agent-tools",
     "crates/agent-skills",
     "crates/agent-memory",
+    "crates/agent-evolution",
     "crates/agent-config",
     "crates/agent-telemetry",
     "apps/agent-cli",
@@ -29,6 +30,7 @@ agent-skills    = { path = "crates/agent-skills" }
 agent-memory    = { path = "crates/agent-memory" }
 agent-config    = { path = "crates/agent-config" }
 agent-telemetry = { path = "crates/agent-telemetry" }
+agent-evolution = { path = "crates/agent-evolution" }
 
 # 异步运行时与流
 tokio        = { version = "1", features = ["full"] }
@@ -51,7 +53,7 @@ tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # CLI 与 REPL
-clap      = { version = "4", features = ["derive"] }
+clap      = { version = "4", features = ["derive", "env"] }
 rustyline = "14"
 crossterm = "0.28"
 
@@ -65,6 +67,7 @@ regex          = "1"
 
 # 工具相关
 glob = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
 
 # 测试
 mockall  = "0.13"

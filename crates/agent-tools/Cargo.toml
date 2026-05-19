@@ -16,3 +16,7 @@ thiserror   = { workspace = true }
 async-trait = { workspace = true }
 tokio       = { workspace = true }
 tracing     = { workspace = true }
+regex       = { workspace = true }
+glob        = { workspace = true }
+reqwest     = { workspace = true }
+uuid        = { workspace = true }
