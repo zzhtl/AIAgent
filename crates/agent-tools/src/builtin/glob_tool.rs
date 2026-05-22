@@ -9,6 +9,10 @@ use serde_json::{json, Value};
 use super::path_safety;
 
 const MAX_RESULTS: usize = 200;
+/// Defensive cap on how many filesystem entries we will visit before
+/// admitting defeat — prevents `cwd: "/"` + `pattern: "**/*"` from
+/// scanning the entire host.
+const MAX_VISITED: usize = 100_000;
 
 #[derive(Default)]
 pub struct GlobTool;
@@ -69,28 +73,51 @@ impl Tool for GlobTool {
             require_literal_leading_dot: false,
         };
 
-        let iter = glob_with(&pattern_str, options).map_err(|e| ToolError::InvalidArguments {
-            tool: "glob".into(),
-            detail: e.to_string(),
-        })?;
-
-        let mut paths = Vec::new();
-        let mut truncated = false;
-        for entry in iter {
-            match entry {
-                Ok(p) => {
-                    let rel = p.strip_prefix(&cwd).unwrap_or(&p).display().to_string();
-                    paths.push(rel);
-                    if paths.len() >= MAX_RESULTS {
-                        truncated = true;
-                        break;
+        // glob_with walks the filesystem synchronously; ship it to a
+        // blocking worker so the tokio reactor is never stalled. We also
+        // cap the total number of visited entries to keep pathological
+        // patterns (`cwd: "/", pattern: "**/*"`) from hanging the agent.
+        let cwd_for_walk = cwd.clone();
+        let join = tokio::task::spawn_blocking(move || {
+            let iter = glob_with(&pattern_str, options).map_err(|e| e.to_string())?;
+            let mut paths: Vec<String> = Vec::new();
+            let mut visited: usize = 0;
+            let mut truncated = false;
+            for entry in iter {
+                visited += 1;
+                if visited > MAX_VISITED {
+                    truncated = true;
+                    break;
+                }
+                match entry {
+                    Ok(p) => {
+                        let rel = p
+                            .strip_prefix(&cwd_for_walk)
+                            .unwrap_or(&p)
+                            .display()
+                            .to_string();
+                        paths.push(rel);
+                        if paths.len() >= MAX_RESULTS {
+                            truncated = true;
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "glob entry error");
                     }
                 }
-                Err(e) => {
-                    tracing::debug!(error = %e, "glob entry error");
-                }
             }
-        }
+            Ok::<(Vec<String>, bool), String>((paths, truncated))
+        })
+        .await;
+
+        let (paths, truncated) = match join {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                return Err(ToolError::InvalidArguments { tool: "glob".into(), detail: e })
+            }
+            Err(e) => return Ok(ToolOutcome::error(format!("glob join: {e}"))),
+        };
 
         if paths.is_empty() {
             return Ok(ToolOutcome::ok(format!("no matches for `{}`", args.pattern)));

@@ -96,6 +96,10 @@ pub enum StopReason {
     EndTurn,
     ToolUse,
     MaxTokens,
+    /// The agent loop hit its `max_steps` cap before the model signalled
+    /// `end_turn`. Distinct from `MaxTokens` (which is the model's own
+    /// length-limit signal) so the CLI can render a clearer message.
+    MaxSteps,
     Cancelled,
     Error,
 }

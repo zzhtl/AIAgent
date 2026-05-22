@@ -17,6 +17,6 @@ pub mod sqlite;
 pub mod vectors;
 
 pub use facts::MarkdownFactStore;
-pub use prompt::FactsPromptProvider;
+pub use prompt::{FactsPromptProvider, VectorRecallPromptProvider};
 pub use sqlite::SqliteSessionStore;
 pub use vectors::SimpleVectorStore;

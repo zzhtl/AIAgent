@@ -33,7 +33,7 @@ impl Tool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Run a shell command via `bash -lc`. Returns stdout/stderr (each \
+        "Run a shell command via `bash -c`. Returns stdout/stderr (each \
          capped at 16 KiB) and the exit code. `timeout_secs` is bounded by \
          the runtime permission cap."
     }
@@ -71,7 +71,7 @@ impl Tool for BashTool {
             .unwrap_or_else(|| ctx.workspace.clone());
 
         let mut cmd = Command::new("bash");
-        cmd.arg("-lc")
+        cmd.arg("-c")
             .arg(&args.command)
             .current_dir(&cwd)
             .stdout(Stdio::piped())

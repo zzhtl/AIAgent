@@ -242,19 +242,17 @@ where
 {
     let stream = async_stream::try_stream! {
         let mut byte_stream = Box::pin(byte_stream);
-        let mut buffer = String::new();
+        let mut buffer = crate::sse::SseLineBuffer::new();
         let mut state = StreamState::default();
 
         while let Some(chunk) = byte_stream.next().await {
             let chunk = chunk.map_err(|e| LlmError::Network(e.to_string()))?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            buffer.extend(&chunk);
 
             // SSE in Anthropic uses `event: <name>\ndata: <json>\n\n`. We
             // ignore the `event:` line (the JSON's own `type` field carries
             // the event kind) and parse each `data:` payload as JSON.
-            while let Some(idx) = buffer.find('\n') {
-                let line = buffer[..idx].trim_end_matches('\r').to_string();
-                buffer.drain(..=idx);
+            while let Some(line) = buffer.next_line() {
                 if line.is_empty() {
                     continue;
                 }
@@ -340,7 +338,7 @@ impl StreamState {
                         index,
                         id: entry.id.clone(),
                         name: entry.name.clone(),
-                        arguments_delta: Some(entry.args_buf.clone()),
+                        arguments_delta: Some(partial_json),
                     });
                 }
             },

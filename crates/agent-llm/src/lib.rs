@@ -8,6 +8,7 @@
 
 pub mod providers;
 pub mod registry;
+pub mod sse;
 
 pub use registry::ProviderRegistry;
 

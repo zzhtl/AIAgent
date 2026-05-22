@@ -88,10 +88,8 @@ impl Fact {
         let first_line = self.body.lines().next().unwrap_or("").trim();
         if first_line.is_empty() {
             self.name.clone()
-        } else if first_line.len() > 200 {
-            format!("{}: {}…", self.name, &first_line[..200])
         } else {
-            format!("{}: {}", self.name, first_line)
+            format!("{}: {}", self.name, crate::text::truncate_with_ellipsis(first_line, 200))
         }
     }
 }

@@ -43,6 +43,20 @@ pub struct UsageSummary {
     pub cost_estimate_usd: f64,
 }
 
+/// A compressed snapshot of an early portion of a session's transcript.
+/// Written by a summariser when conversation length grows past a threshold;
+/// the next turn can replace those early messages with the summary body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptSummary {
+    pub id: i64,
+    pub body: String,
+    /// Highest message row id covered by this summary, when known. `None`
+    /// means "everything up to the time of writing".
+    pub cutoff_message_id: Option<i64>,
+    /// UNIX seconds.
+    pub created_at: i64,
+}
+
 impl UsageSummary {
     pub fn total_tokens(&self) -> u64 {
         self.prompt_tokens + self.completion_tokens
@@ -80,4 +94,31 @@ pub trait SessionStore: Send + Sync {
 
     /// Aggregated usage for this session (all rounds).
     async fn session_usage(&self, sid: &SessionId) -> StoreResult<UsageSummary>;
+
+    /// Persist a transcript summary. `cutoff_message_id` is the inclusive
+    /// upper bound of message rows this summary replaces; pass `None` if
+    /// not tracking row ids. Returns the new summary's row id.
+    ///
+    /// Default impl is a no-op so legacy stores remain valid; the SQLite
+    /// implementation overrides this with a real insert.
+    async fn record_summary(
+        &self,
+        _sid: &SessionId,
+        _body: &str,
+        _cutoff_message_id: Option<i64>,
+    ) -> StoreResult<i64> {
+        Err(SessionStoreError::Backend(
+            "summarisation not supported by this store".into(),
+        ))
+    }
+
+    /// All transcript summaries for a session, oldest first.
+    async fn list_summaries(&self, _sid: &SessionId) -> StoreResult<Vec<TranscriptSummary>> {
+        Ok(Vec::new())
+    }
+
+    /// Most recently written summary, if any.
+    async fn latest_summary(&self, sid: &SessionId) -> StoreResult<Option<TranscriptSummary>> {
+        Ok(self.list_summaries(sid).await?.into_iter().last())
+    }
 }

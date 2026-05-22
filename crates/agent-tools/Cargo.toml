@@ -20,3 +20,4 @@ regex       = { workspace = true }
 glob        = { workspace = true }
 reqwest     = { workspace = true }
 uuid        = { workspace = true }
+futures     = { workspace = true }

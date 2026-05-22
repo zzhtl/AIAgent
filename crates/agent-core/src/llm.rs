@@ -105,6 +105,11 @@ pub enum LlmEvent {
 
     /// Tool-call argument fragments are accumulating. `index` lets multiple
     /// parallel tool calls be assembled in order.
+    ///
+    /// `arguments_delta` is the **incremental** slice received in this event
+    /// (concatenate to build the full argument JSON), not the full buffer
+    /// so far. Consumers that only care about the final value should wait
+    /// for `ToolCallReady`.
     ToolCallDelta {
         index: u32,
         id: Option<String>,

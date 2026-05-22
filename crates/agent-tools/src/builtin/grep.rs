@@ -82,8 +82,19 @@ impl Tool for GrepTool {
 
         let glob_pattern = args.glob.as_deref().and_then(|g| Pattern::new(g).ok());
 
-        let mut paths: Vec<PathBuf> = Vec::new();
-        walk_files(&root, &mut paths, 10_000);
+        // Filesystem walk is synchronous; hand it to a blocking pool so we
+        // don't stall the tokio runtime on large trees.
+        let walk_root = root.clone();
+        let paths: Vec<PathBuf> = match tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            walk_files(&walk_root, &mut out, 10_000);
+            out
+        })
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => return Ok(ToolOutcome::error(format!("walk: {e}"))),
+        };
 
         let mut hits = Vec::new();
         'outer: for path in paths {
@@ -97,11 +108,7 @@ impl Tool for GrepTool {
             let rel = path.strip_prefix(&root).unwrap_or(&path).display().to_string();
             for (idx, line) in content.lines().enumerate() {
                 if re.is_match(line) {
-                    let shown = if line.len() > MAX_LINE_LEN {
-                        format!("{}…", &line[..MAX_LINE_LEN])
-                    } else {
-                        line.to_string()
-                    };
+                    let shown = agent_core::text::truncate_with_ellipsis(line, MAX_LINE_LEN);
                     hits.push(format!("{rel}:{}: {shown}", idx + 1));
                     if hits.len() >= MAX_MATCHES {
                         break 'outer;

@@ -28,3 +28,4 @@ clap    = { workspace = true }
 tokio   = { workspace = true }
 tracing = { workspace = true }
 futures = { workspace = true }
+chrono  = { workspace = true }

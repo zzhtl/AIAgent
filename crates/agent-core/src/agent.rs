@@ -111,7 +111,7 @@ impl Agent {
                     yield AgentEvent::Warning {
                         message: format!("max_steps ({}) reached; stopping.", config.max_steps),
                     };
-                    break StopReason::MaxTokens;
+                    break StopReason::MaxSteps;
                 }
 
                 debug!(step = steps, "agent: sending chat request");

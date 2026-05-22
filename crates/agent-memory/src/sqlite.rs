@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_core::{
     ContentBlock, Message, Role, SessionId, SessionStore, SessionStoreError, SessionSummary,
-    StoreResult, TokenUsage, UsageSummary,
+    StoreResult, TokenUsage, TranscriptSummary, UsageSummary,
 };
 use async_trait::async_trait;
 use sqlx::{
@@ -264,6 +264,76 @@ impl SessionStore for SqliteSessionStore {
             cached_tokens: cached.max(0) as u64,
             cost_estimate_usd: cost,
         })
+    }
+
+    async fn record_summary(
+        &self,
+        sid: &SessionId,
+        body: &str,
+        cutoff_message_id: Option<i64>,
+    ) -> StoreResult<i64> {
+        let now = now_secs();
+        let row = sqlx::query(
+            "INSERT INTO summaries (session_id, body, cutoff_message_id, created_at) \
+             VALUES (?, ?, ?, ?) RETURNING id",
+        )
+        .bind(sid.as_str())
+        .bind(body)
+        .bind(cutoff_message_id)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| SessionStoreError::Backend(format!("insert summary: {e}")))?;
+        let id: i64 = row.try_get("id").map_err(serde_err)?;
+        Ok(id)
+    }
+
+    async fn list_summaries(&self, sid: &SessionId) -> StoreResult<Vec<TranscriptSummary>> {
+        let rows = sqlx::query(
+            "SELECT id, body, cutoff_message_id, created_at \
+             FROM summaries WHERE session_id = ? ORDER BY id ASC",
+        )
+        .bind(sid.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SessionStoreError::Backend(format!("list summaries: {e}")))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: i64 = row.try_get("id").map_err(serde_err)?;
+            let body: String = row.try_get("body").map_err(serde_err)?;
+            let cutoff: Option<i64> = row.try_get("cutoff_message_id").map_err(serde_err)?;
+            let created_at: i64 = row.try_get("created_at").map_err(serde_err)?;
+            out.push(TranscriptSummary {
+                id,
+                body,
+                cutoff_message_id: cutoff,
+                created_at,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn latest_summary(&self, sid: &SessionId) -> StoreResult<Option<TranscriptSummary>> {
+        let row = sqlx::query(
+            "SELECT id, body, cutoff_message_id, created_at \
+             FROM summaries WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(sid.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| SessionStoreError::Backend(format!("latest summary: {e}")))?;
+        let Some(row) = row else { return Ok(None) };
+        let id: i64 = row.try_get("id").map_err(serde_err)?;
+        let body: String = row.try_get("body").map_err(serde_err)?;
+        let cutoff: Option<i64> = row.try_get("cutoff_message_id").map_err(serde_err)?;
+        let created_at: i64 = row.try_get("created_at").map_err(serde_err)?;
+        Ok(Some(TranscriptSummary {
+            id,
+            body,
+            cutoff_message_id: cutoff,
+            created_at,
+        }))
     }
 }
 

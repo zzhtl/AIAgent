@@ -18,6 +18,7 @@ pub mod message;
 pub mod prompt;
 pub mod session;
 pub mod store;
+pub mod text;
 pub mod tool;
 
 pub use channel::{AgentEvent, Channel, UserInput};
@@ -42,4 +43,6 @@ pub use memory::{
     EmbeddingProvider, Fact, FactId, FactKind, FactStore, MemoryError, MemoryHit, MemoryResult,
     NewFact, VectorStore,
 };
-pub use store::{SessionStore, SessionStoreError, SessionSummary, StoreResult, UsageSummary};
+pub use store::{
+    SessionStore, SessionStoreError, SessionSummary, StoreResult, TranscriptSummary, UsageSummary,
+};

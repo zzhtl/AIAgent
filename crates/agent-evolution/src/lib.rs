@@ -11,6 +11,8 @@
 //! so tools (`agent-tools`) can enqueue without depending on this crate.
 
 pub mod reflection;
+pub mod summariser;
 
 pub use agent_core::evolution::{Candidate, CandidateError, CandidateKind, CandidateQueue};
 pub use reflection::Reflector;
+pub use summariser::Summariser;

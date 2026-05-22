@@ -116,11 +116,7 @@ fn format_transcript(messages: &[Message]) -> String {
             }
             continue;
         }
-        let trimmed = if text.len() > 600 {
-            format!("{}…", &text[..600])
-        } else {
-            text
-        };
+        let trimmed = agent_core::text::truncate_with_ellipsis(&text, 600);
         out.push_str(&format!("[{label}]\n{trimmed}\n\n"));
     }
     out
@@ -139,7 +135,7 @@ fn split_title(text: &str) -> (Option<String>, String) {
         if cleaned.is_empty() {
             None
         } else {
-            Some(cleaned.chars().take(40).collect::<String>())
+            Some(agent_core::text::truncate_chars(cleaned, 40))
         }
     };
     let body: String = lines.collect::<Vec<_>>().join("\n");

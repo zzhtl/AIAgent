@@ -245,18 +245,16 @@ where
 {
     let stream = async_stream::try_stream! {
         let mut byte_stream = Box::pin(byte_stream);
-        let mut buffer = String::new();
+        let mut buffer = crate::sse::SseLineBuffer::new();
         let mut state = StreamState::default();
 
         while let Some(chunk) = byte_stream.next().await {
             let chunk = chunk.map_err(|e| LlmError::Network(e.to_string()))?;
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            buffer.extend(&chunk);
 
             // SSE events are separated by blank lines, but in practice OpenAI
             // sends one `data:` line per event. Split per-line and process.
-            while let Some(idx) = buffer.find('\n') {
-                let line = buffer[..idx].trim_end_matches('\r').to_string();
-                buffer.drain(..=idx);
+            while let Some(line) = buffer.next_line() {
                 if line.is_empty() {
                     continue;
                 }
@@ -359,19 +357,23 @@ impl StreamState {
                         if let Some(id) = tc.id {
                             entry.id = Some(id);
                         }
+                        let mut args_fragment: Option<String> = None;
                         if let Some(func) = tc.function {
                             if let Some(name) = func.name {
                                 entry.name = Some(name);
                             }
                             if let Some(args) = func.arguments {
-                                entry.args_buf.push_str(&args);
+                                if !args.is_empty() {
+                                    entry.args_buf.push_str(&args);
+                                    args_fragment = Some(args);
+                                }
                             }
                         }
                         out.push(LlmEvent::ToolCallDelta {
                             index: tc.index,
                             id: entry.id.clone(),
                             name: entry.name.clone(),
-                            arguments_delta: Some(entry.args_buf.clone()),
+                            arguments_delta: args_fragment,
                         });
                     }
                 }

@@ -7,24 +7,32 @@ use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+use agent_config::AgentConfig;
+use agent_core::agent::RunConfig;
 use agent_core::evolution::{CandidateKind, CandidateQueue};
 use agent_core::{
     Agent, AgentEvent, ChainedPromptProvider, FactId, FactKind, FactStore, LlmProvider, Message,
     NewFact, PromptProvider, SessionId, SessionStore, StopReason, TokenUsage, ToolRegistry,
     UserInput,
 };
-use agent_evolution::Reflector;
+use agent_evolution::{Reflector, Summariser};
+use agent_core::memory::{EmbeddingProvider, VectorStore};
 use agent_llm::providers::anthropic::{AnthropicConfig, AnthropicProvider};
 use agent_llm::providers::openai::{OpenAiConfig, OpenAiProvider};
-use agent_memory::{FactsPromptProvider, MarkdownFactStore, SqliteSessionStore};
+use agent_llm::providers::openai_embeddings::OpenAiEmbeddingProvider;
+use agent_memory::{
+    FactsPromptProvider, MarkdownFactStore, SimpleVectorStore, SqliteSessionStore,
+    VectorRecallPromptProvider,
+};
 use agent_skills::{Augmenter, RuleSet, SkillRegistry};
 
 #[derive(Parser)]
 #[command(name = "agent", version, about = "AI Agent CLI", long_about = None)]
 struct Cli {
     /// Provider id: `openai`, `deepseek`, or `claude` / `anthropic`.
-    #[arg(long, global = true, default_value = "openai")]
-    provider: String,
+    /// Falls back to the value in `config.toml` (default `openai`).
+    #[arg(long, global = true)]
+    provider: Option<String>,
 
     /// Model id. Defaults to a provider-specific value when omitted.
     #[arg(long, global = true)]
@@ -45,6 +53,35 @@ struct Cli {
 
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+/// Effective settings after merging CLI flags on top of the layered config.
+struct EffectiveCli {
+    provider: String,
+    model: Option<String>,
+    no_tools: bool,
+    evolve: bool,
+    config_dir: PathBuf,
+    config: AgentConfig,
+}
+
+impl EffectiveCli {
+    fn from(cli: &Cli) -> Result<Self> {
+        let config = AgentConfig::load(cli.config_dir.as_deref())
+            .map_err(|e| anyhow!("config: {e}"))?;
+        let provider = cli
+            .provider
+            .clone()
+            .unwrap_or_else(|| config.provider.clone());
+        let model = cli.model.clone().or_else(|| config.model.clone());
+        let evolve = cli.evolve || config.evolve;
+        let no_tools = cli.no_tools || config.no_tools;
+        let config_dir = cli
+            .config_dir
+            .clone()
+            .unwrap_or_else(|| config.config_dir());
+        Ok(Self { provider, model, no_tools, evolve, config_dir, config })
+    }
 }
 
 #[derive(Subcommand)]
@@ -114,6 +151,9 @@ enum MemoryCmd {
         #[arg(long, default_value = "note")]
         kind: String,
     },
+    /// Re-build the vector index by embedding every fact and upserting it
+    /// into the SQLite `vectors` table. Requires `OPENAI_API_KEY`.
+    Index,
 }
 
 #[tokio::main]
@@ -121,18 +161,17 @@ async fn main() -> Result<()> {
     agent_telemetry::init_default();
     let mut cli = Cli::parse();
 
-    match cli.command.take() {
-        Some(Command::Chat) => cmd_chat(&cli).await,
-        Some(Command::Run { prompt }) => cmd_run(&cli, prompt).await,
-        Some(Command::Sessions { limit }) => cmd_sessions(&cli, limit).await,
-        Some(Command::Resume { session_id }) => cmd_resume(&cli, session_id).await,
-        Some(Command::Skills) => cmd_skills(&cli),
-        Some(Command::Memory { action }) => cmd_memory(&cli, action).await,
-        Some(Command::Evolution { action }) => cmd_evolution(&cli, action).await,
-        Some(Command::Config) => {
-            println!("[config] not implemented yet");
-            Ok(())
-        }
+    let cmd = cli.command.take();
+    let eff = EffectiveCli::from(&cli)?;
+    match cmd {
+        Some(Command::Chat) => cmd_chat(&eff).await,
+        Some(Command::Run { prompt }) => cmd_run(&eff, prompt).await,
+        Some(Command::Sessions { limit }) => cmd_sessions(&eff, limit).await,
+        Some(Command::Resume { session_id }) => cmd_resume(&eff, session_id).await,
+        Some(Command::Skills) => cmd_skills(&eff),
+        Some(Command::Memory { action }) => cmd_memory(&eff, action).await,
+        Some(Command::Evolution { action }) => cmd_evolution(&eff, action).await,
+        Some(Command::Config) => cmd_config(&eff),
         None => {
             println!("agent — AI Agent runtime");
             println!("run `agent --help` to see available commands");
@@ -141,8 +180,49 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn cmd_run(cli: &Cli, prompt: String) -> Result<()> {
-    let bundle = build_bundle(cli)?;
+fn cmd_config(eff: &EffectiveCli) -> Result<()> {
+    println!("provider:    {}", eff.provider);
+    println!(
+        "model:       {}",
+        eff.model.as_deref().unwrap_or("<provider default>")
+    );
+    println!("config_dir:  {}", eff.config_dir.display());
+    println!("no_tools:    {}", eff.no_tools);
+    println!("evolve:      {}", eff.evolve);
+    println!();
+    println!("[loop]");
+    println!("  max_steps:   {}", eff.config.agent.max_steps);
+    println!(
+        "  max_tokens:  {}",
+        eff.config
+            .agent
+            .max_tokens
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "<unset>".into())
+    );
+    println!(
+        "  temperature: {}",
+        eff.config
+            .agent
+            .temperature
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "<unset>".into())
+    );
+    println!();
+    println!("[permissions]");
+    println!("  allow_read:       {}", eff.config.permissions.allow_read);
+    println!("  allow_write:      {}", eff.config.permissions.allow_write);
+    println!("  allow_shell:      {}", eff.config.permissions.allow_shell);
+    println!("  allow_network:    {}", eff.config.permissions.allow_network);
+    println!(
+        "  max_runtime_secs: {}",
+        eff.config.permissions.max_runtime_secs
+    );
+    Ok(())
+}
+
+async fn cmd_run(eff: &EffectiveCli, prompt: String) -> Result<()> {
+    let bundle = build_bundle(eff).await?;
     let title = title_from(&prompt);
     let sid = bundle
         .session_store
@@ -157,15 +237,15 @@ async fn cmd_run(cli: &Cli, prompt: String) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_chat(cli: &Cli) -> Result<()> {
-    let bundle = build_bundle(cli)?;
+async fn cmd_chat(eff: &EffectiveCli) -> Result<()> {
+    let bundle = build_bundle(eff).await?;
     let sid = bundle
         .session_store
         .create_session(None)
         .await
         .map_err(|e| anyhow!("create_session: {e}"))?;
 
-    println!("Connected to {} ({}). Session: {}", cli.provider, bundle.model, sid);
+    println!("Connected to {} ({}). Session: {}", eff.provider, bundle.model, sid);
     if bundle.evolve {
         println!("Self-reflection enabled (--evolve).");
     }
@@ -178,8 +258,8 @@ async fn cmd_chat(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_resume(cli: &Cli, session_id: String) -> Result<()> {
-    let bundle = build_bundle(cli)?;
+async fn cmd_resume(eff: &EffectiveCli, session_id: String) -> Result<()> {
+    let bundle = build_bundle(eff).await?;
     let sid = SessionId::from(session_id.as_str());
 
     let history = bundle
@@ -192,7 +272,7 @@ async fn cmd_resume(cli: &Cli, session_id: String) -> Result<()> {
         sid,
         history.len(),
         if history.is_empty() { "empty" } else { "ready" },
-        cli.provider,
+        eff.provider,
         bundle.model,
     );
 
@@ -203,8 +283,8 @@ async fn cmd_resume(cli: &Cli, session_id: String) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_sessions(cli: &Cli, limit: usize) -> Result<()> {
-    let store = open_session_store(cli).await?;
+async fn cmd_sessions(eff: &EffectiveCli, limit: usize) -> Result<()> {
+    let store = open_session_store(eff).await?;
     let sessions = store
         .list_sessions(limit)
         .await
@@ -227,8 +307,8 @@ async fn cmd_sessions(cli: &Cli, limit: usize) -> Result<()> {
     Ok(())
 }
 
-fn cmd_skills(cli: &Cli) -> Result<()> {
-    let config_dir = resolve_config_dir(cli);
+fn cmd_skills(eff: &EffectiveCli) -> Result<()> {
+    let config_dir = eff.config_dir.clone();
     let skills_dir = config_dir.join("skills");
     let rules_dir = config_dir.join("rules");
 
@@ -268,8 +348,8 @@ fn cmd_skills(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_memory(cli: &Cli, action: MemoryCmd) -> Result<()> {
-    let fact_store = open_fact_store(cli);
+async fn cmd_memory(eff: &EffectiveCli, action: MemoryCmd) -> Result<()> {
+    let fact_store = open_fact_store(eff);
     match action {
         MemoryCmd::List { kind } => {
             let kind = kind.as_deref().and_then(parse_kind);
@@ -334,12 +414,72 @@ async fn cmd_memory(cli: &Cli, action: MemoryCmd) -> Result<()> {
                 .map_err(|e| anyhow!("save: {e}"))?;
             println!("saved {name} (id: {id})");
         }
+        MemoryCmd::Index => cmd_memory_index(eff, fact_store).await?,
     }
     Ok(())
 }
 
-async fn cmd_evolution(cli: &Cli, action: EvolutionCmd) -> Result<()> {
-    let config_dir = resolve_config_dir(cli);
+async fn cmd_memory_index(eff: &EffectiveCli, fact_store: Arc<dyn FactStore>) -> Result<()> {
+    let key = std::env::var("OPENAI_API_KEY")
+        .context("OPENAI_API_KEY is required for embeddings")?;
+    let embedder = OpenAiEmbeddingProvider::new(key)
+        .map_err(|e| anyhow!("embedder init: {e}"))?;
+
+    let store = open_session_store_concrete(eff).await?;
+    let vectors = SimpleVectorStore::from_session_store(&store);
+
+    let facts = fact_store
+        .list(None)
+        .await
+        .map_err(|e| anyhow!("list facts: {e}"))?;
+    if facts.is_empty() {
+        println!("No facts to index.");
+        return Ok(());
+    }
+
+    println!("Indexing {} fact(s) with model {} …", facts.len(), embedder.model());
+    // Embed in small batches to stay friendly to the API.
+    const BATCH: usize = 16;
+    let mut indexed = 0usize;
+    for chunk in facts.chunks(BATCH) {
+        let texts: Vec<String> = chunk
+            .iter()
+            .map(|f| format!("{}\n\n{}", f.name, f.body))
+            .collect();
+        let embeddings = embedder
+            .embed(&texts)
+            .await
+            .map_err(|e| anyhow!("embed: {e}"))?;
+        for (fact, emb) in chunk.iter().zip(embeddings) {
+            let key = format!("fact:{}", fact.id);
+            let metadata = serde_json::json!({
+                "fact_id": fact.id.as_str(),
+                "name": fact.name,
+                "kind": format_kind(fact.kind),
+            });
+            vectors
+                .upsert(&key, &texts[indexed % BATCH], emb, metadata)
+                .await
+                .map_err(|e| anyhow!("upsert: {e}"))?;
+            indexed += 1;
+        }
+    }
+    println!("Indexed {indexed} fact(s).");
+    Ok(())
+}
+
+async fn open_session_store_concrete(eff: &EffectiveCli) -> Result<SqliteSessionStore> {
+    let config_dir = eff.config_dir.clone();
+    std::fs::create_dir_all(&config_dir)
+        .with_context(|| format!("create_dir_all {}", config_dir.display()))?;
+    let db_path = config_dir.join("sessions.db");
+    SqliteSessionStore::open(&db_path)
+        .await
+        .map_err(|e| anyhow!("open sessions.db: {e}"))
+}
+
+async fn cmd_evolution(eff: &EffectiveCli, action: EvolutionCmd) -> Result<()> {
+    let config_dir = eff.config_dir.clone();
     let queue = open_candidate_queue(&config_dir);
     match action {
         EvolutionCmd::Review => {
@@ -470,6 +610,7 @@ async fn drive(
     mut history: Vec<Message>,
     input: UserInput,
 ) -> Result<Vec<Message>> {
+    history = maybe_compact_history(bundle, sid, history).await;
     let mut stream = bundle.agent.run(sid.clone(), history.clone(), input);
     let mut pending_usages: Vec<(String, TokenUsage)> = Vec::new();
 
@@ -500,8 +641,16 @@ async fn drive(
                     }
                 }
                 history.extend(transcript_delta);
-                if reason == StopReason::MaxTokens {
-                    eprintln!("\n[note] response may be truncated (max_tokens / max_steps)");
+                match reason {
+                    StopReason::MaxTokens => {
+                        eprintln!("\n[note] response truncated by model max_tokens");
+                    }
+                    StopReason::MaxSteps => {
+                        eprintln!(
+                            "\n[note] reached the agent loop cap (max_steps); some work may be incomplete"
+                        );
+                    }
+                    _ => {}
                 }
                 break;
             }
@@ -513,6 +662,44 @@ async fn drive(
         let _ = bundle.session_store.record_usage(sid, &m, usage, cost).await;
     }
     Ok(history)
+}
+
+/// If the in-memory transcript has grown past `summary_threshold`, ask the
+/// Summariser to compress the early portion and replace it with a single
+/// system-prompt summary message. Best-effort: any failure leaves the
+/// history untouched.
+async fn maybe_compact_history(
+    bundle: &AgentBundle,
+    sid: &SessionId,
+    history: Vec<Message>,
+) -> Vec<Message> {
+    let threshold = bundle.summary_threshold;
+    if threshold == 0 || history.len() <= threshold {
+        return history;
+    }
+    let Some(summariser) = bundle.summariser.as_ref() else {
+        return history;
+    };
+    let keep_tail = bundle.summary_keep_tail.min(history.len());
+    let split_at = history.len().saturating_sub(keep_tail);
+    if split_at == 0 {
+        return history;
+    }
+    let (head, tail) = history.split_at(split_at);
+    eprintln!(
+        "[compacting {} earlier messages into a summary …]",
+        head.len()
+    );
+    let Some(summary) = summariser.summarise(head).await else {
+        return [head, tail].concat();
+    };
+    if let Err(e) = bundle.session_store.record_summary(sid, &summary, None).await {
+        tracing::debug!(error = %e, "record_summary failed");
+    }
+    let mut compact = Vec::with_capacity(tail.len() + 1);
+    compact.push(Message::system(format!("# Earlier conversation summary\n\n{summary}")));
+    compact.extend(tail.iter().cloned());
+    compact
 }
 
 async fn maybe_reflect(bundle: &AgentBundle, history: &[Message]) {
@@ -550,20 +737,23 @@ struct AgentBundle {
     agent: Agent,
     session_store: Arc<dyn SessionStore>,
     reflector: Option<Reflector>,
+    summariser: Option<Summariser>,
+    summary_threshold: usize,
+    summary_keep_tail: usize,
     evolve: bool,
     model: String,
 }
 
-fn build_bundle(cli: &Cli) -> Result<AgentBundle> {
-    let (provider, model) = build_provider(cli)?;
+async fn build_bundle(eff: &EffectiveCli) -> Result<AgentBundle> {
+    let (provider, model) = build_provider(eff)?;
     let mut tools = ToolRegistry::new();
-    if !cli.no_tools {
+    if !eff.no_tools {
         agent_tools::register_builtins(&mut tools);
         agent_tools::register_memory_tools(&mut tools);
         agent_tools::register_evolution_tools(&mut tools);
     }
 
-    let config_dir = resolve_config_dir(cli);
+    let config_dir = eff.config_dir.clone();
     std::fs::create_dir_all(&config_dir)
         .with_context(|| format!("create_dir_all {}", config_dir.display()))?;
 
@@ -585,12 +775,20 @@ fn build_bundle(cli: &Cli) -> Result<AgentBundle> {
 
     let candidate_queue = open_candidate_queue(&config_dir);
 
+    let run_config = RunConfig {
+        max_steps: eff.config.agent.max_steps,
+        temperature: eff.config.agent.temperature,
+        max_tokens: eff.config.agent.max_tokens,
+        permissions: eff.config.permissions.to_runtime(),
+    };
+
     let mut builder = Agent::builder()
         .with_llm(provider.clone())
         .with_model(model.clone())
         .with_tools(tools)
         .with_fact_store(fact_store.clone())
         .with_candidate_queue(candidate_queue)
+        .with_config(run_config)
         .with_workspace(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     if !chain.is_empty() {
         let provider_arc: Arc<dyn PromptProvider> = Arc::new(chain);
@@ -598,31 +796,40 @@ fn build_bundle(cli: &Cli) -> Result<AgentBundle> {
     }
     let agent = builder.build().map_err(|e| anyhow!("agent builder: {e}"))?;
 
-    let reflector = if cli.evolve {
-        Some(Reflector::new(provider, model.clone(), fact_store.clone()))
+    let reflector = if eff.evolve {
+        Some(Reflector::new(provider.clone(), model.clone(), fact_store.clone()))
     } else {
         None
     };
 
-    // We need a sync handle to the session store as well; build it here so
-    // the bundle owns it.
-    let session_store = futures::executor::block_on(open_session_store(cli))?;
+    let summary_threshold = eff.config.agent.summary_threshold;
+    let summary_keep_tail = eff.config.agent.summary_keep_tail.max(1);
+    let summariser = if summary_threshold > 0 {
+        Some(Summariser::new(provider, model.clone()))
+    } else {
+        None
+    };
+
+    let session_store = open_session_store(eff).await?;
 
     Ok(AgentBundle {
         agent,
         session_store,
         reflector,
-        evolve: cli.evolve,
+        summariser,
+        summary_threshold,
+        summary_keep_tail,
+        evolve: eff.evolve,
         model,
     })
 }
 
-fn build_provider(cli: &Cli) -> Result<(Arc<dyn LlmProvider>, String)> {
-    let provider_id = cli.provider.to_ascii_lowercase();
+fn build_provider(eff: &EffectiveCli) -> Result<(Arc<dyn LlmProvider>, String)> {
+    let provider_id = eff.provider.to_ascii_lowercase();
     match provider_id.as_str() {
         "openai" => {
             let key = std::env::var("OPENAI_API_KEY").context("OPENAI_API_KEY is not set")?;
-            let model = cli.model.clone().unwrap_or_else(|| "gpt-4o-mini".into());
+            let model = eff.model.clone().unwrap_or_else(|| "gpt-4o-mini".into());
             let provider: Arc<dyn LlmProvider> = Arc::new(
                 OpenAiProvider::new(OpenAiConfig::openai(key))
                     .map_err(|e| anyhow!("provider init: {e}"))?,
@@ -631,7 +838,7 @@ fn build_provider(cli: &Cli) -> Result<(Arc<dyn LlmProvider>, String)> {
         }
         "deepseek" => {
             let key = std::env::var("DEEPSEEK_API_KEY").context("DEEPSEEK_API_KEY is not set")?;
-            let model = cli.model.clone().unwrap_or_else(|| "deepseek-chat".into());
+            let model = eff.model.clone().unwrap_or_else(|| "deepseek-chat".into());
             let provider: Arc<dyn LlmProvider> = Arc::new(
                 OpenAiProvider::new(OpenAiConfig::deepseek(key))
                     .map_err(|e| anyhow!("provider init: {e}"))?,
@@ -640,10 +847,10 @@ fn build_provider(cli: &Cli) -> Result<(Arc<dyn LlmProvider>, String)> {
         }
         "claude" | "anthropic" => {
             let key = std::env::var("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY is not set")?;
-            let model = cli
+            let model = eff
                 .model
                 .clone()
-                .unwrap_or_else(|| "claude-sonnet-4-6".into());
+                .unwrap_or_else(|| "claude-sonnet-4-5".into());
             let provider: Arc<dyn LlmProvider> = Arc::new(
                 AnthropicProvider::new(AnthropicConfig::new(key))
                     .map_err(|e| anyhow!("provider init: {e}"))?,
@@ -656,8 +863,8 @@ fn build_provider(cli: &Cli) -> Result<(Arc<dyn LlmProvider>, String)> {
     }
 }
 
-async fn open_session_store(cli: &Cli) -> Result<Arc<dyn SessionStore>> {
-    let config_dir = resolve_config_dir(cli);
+async fn open_session_store(eff: &EffectiveCli) -> Result<Arc<dyn SessionStore>> {
+    let config_dir = eff.config_dir.clone();
     std::fs::create_dir_all(&config_dir)
         .with_context(|| format!("create_dir_all {}", config_dir.display()))?;
     let db_path = config_dir.join("sessions.db");
@@ -667,9 +874,8 @@ async fn open_session_store(cli: &Cli) -> Result<Arc<dyn SessionStore>> {
     Ok(Arc::new(store))
 }
 
-fn open_fact_store(cli: &Cli) -> Arc<dyn FactStore> {
-    let config_dir = resolve_config_dir(cli);
-    Arc::new(MarkdownFactStore::open(config_dir.join("memory")))
+fn open_fact_store(eff: &EffectiveCli) -> Arc<dyn FactStore> {
+    Arc::new(MarkdownFactStore::open(eff.config_dir.join("memory")))
 }
 
 fn parse_kind(s: &str) -> Option<FactKind> {
@@ -691,108 +897,24 @@ fn format_kind(k: FactKind) -> &'static str {
     }
 }
 
-fn resolve_config_dir(cli: &Cli) -> PathBuf {
-    if let Some(p) = cli.config_dir.as_ref() {
-        return p.clone();
-    }
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        if !xdg.is_empty() {
-            return PathBuf::from(xdg).join("agent");
-        }
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".config").join("agent");
-    }
-    PathBuf::from(".agent")
-}
-
 fn title_from(input: &str) -> String {
     let trimmed = input.trim();
     let first_line = trimmed.lines().next().unwrap_or("");
     truncate(first_line, 60)
 }
 
-fn truncate(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(max_chars).collect();
-    format!("{head}…")
-}
-
-fn first_line_truncated(body: &str, max_chars: usize) -> String {
-    let line = body.lines().next().unwrap_or("").trim();
-    if line.chars().count() <= max_chars {
-        line.to_string()
-    } else {
-        let head: String = line.chars().take(max_chars).collect();
-        format!("{head}…")
-    }
-}
+use agent_core::text::{first_line_truncated, truncate_with_ellipsis as truncate};
 
 fn fmt_unix(secs: i64) -> String {
-    use std::time::{Duration, UNIX_EPOCH};
-    let when = UNIX_EPOCH + Duration::from_secs(secs.max(0) as u64);
-    match when.duration_since(UNIX_EPOCH) {
-        Ok(d) => {
-            let secs = d.as_secs();
-            let (year, month, day, hour, minute, second) = gmtime_components(secs);
-            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
-        }
-        Err(_) => "—".into(),
-    }
-}
-
-fn gmtime_components(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
-    let second = (secs % 60) as u32;
-    let total_minutes = secs / 60;
-    let minute = (total_minutes % 60) as u32;
-    let total_hours = total_minutes / 60;
-    let hour = (total_hours % 24) as u32;
-    let mut days = total_hours / 24;
-
-    let mut year: i32 = 1970;
-    loop {
-        let ydays = if is_leap(year) { 366 } else { 365 };
-        if days >= ydays {
-            days -= ydays;
-            year += 1;
-        } else {
-            break;
-        }
-    }
-    let months: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-    let mut month = 1u32;
-    for (i, &len) in months.iter().enumerate() {
-        let len = if i == 1 && is_leap(year) { 29 } else { len };
-        if days < len as u64 {
-            month = i as u32 + 1;
-            break;
-        }
-        days -= len as u64;
-    }
-    let day = days as u32 + 1;
-    (year, month, day, hour, minute, second)
-}
-
-fn is_leap(y: i32) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+        .unwrap_or_else(|| "—".into())
 }
 
 fn compact_json(v: &serde_json::Value) -> String {
-    let s = v.to_string();
-    if s.len() > 120 {
-        format!("{}…", &s[..120])
-    } else {
-        s
-    }
+    truncate(&v.to_string(), 120)
 }
 
 fn summarize_result(text: &str) -> String {
-    let first_line = text.lines().next().unwrap_or("");
-    if first_line.len() > 200 {
-        format!("{}…", &first_line[..200])
-    } else {
-        first_line.to_string()
-    }
+    first_line_truncated(text, 200)
 }

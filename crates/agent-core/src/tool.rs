@@ -57,7 +57,7 @@ impl Default for Permissions {
             allow_write: true,
             allow_shell: true,
             allow_network: true,
-            max_runtime_secs: 60,
+            max_runtime_secs: 120,
         }
     }
 }

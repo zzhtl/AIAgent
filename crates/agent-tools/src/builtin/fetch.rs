@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use agent_core::tool::{Tool, ToolContext, ToolError, ToolOutcome, ToolResult};
 use async_trait::async_trait;
+use futures::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -74,17 +75,43 @@ impl Tool for FetchTool {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let bytes = match resp.bytes().await {
-            Ok(b) => b,
-            Err(e) => return Ok(ToolOutcome::error(format!("body: {e}"))),
-        };
-        let truncated = bytes.len() > MAX_BYTES;
-        let slice = if truncated { &bytes[..MAX_BYTES] } else { &bytes[..] };
-        let body = String::from_utf8_lossy(slice).into_owned();
+
+        // Stream the body so we stop pulling bytes once we hit the cap —
+        // avoids downloading a large file just to throw most of it away.
+        let mut stream = resp.bytes_stream();
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut total: u64 = 0;
+        let mut truncated = false;
+        while let Some(chunk) = stream.next().await {
+            let chunk = match chunk {
+                Ok(b) => b,
+                Err(e) => return Ok(ToolOutcome::error(format!("body: {e}"))),
+            };
+            total += chunk.len() as u64;
+            if bytes.len() < MAX_BYTES {
+                let space = MAX_BYTES - bytes.len();
+                if chunk.len() <= space {
+                    bytes.extend_from_slice(&chunk);
+                } else {
+                    bytes.extend_from_slice(&chunk[..space]);
+                    truncated = true;
+                    break;
+                }
+            } else {
+                truncated = true;
+                break;
+            }
+        }
+
+        let body = String::from_utf8_lossy(&bytes).into_owned();
         let header = format!(
             "GET {url} → {status} ({}){}",
             content_type,
-            if truncated { format!(", truncated at {MAX_BYTES} bytes") } else { String::new() }
+            if truncated {
+                format!(", truncated at {MAX_BYTES} bytes (received ≥{total})")
+            } else {
+                String::new()
+            }
         );
         let outcome = if status.is_success() {
             ToolOutcome::ok(format!("{header}\n\n{body}"))
