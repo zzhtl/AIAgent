@@ -112,7 +112,7 @@ enum Command {
         #[command(subcommand)]
         action: EvolutionCmd,
     },
-    /// Print the resolved configuration (not implemented in stage 6).
+    /// Print the resolved configuration.
     Config,
 }
 
@@ -207,6 +207,17 @@ fn cmd_config(eff: &EffectiveCli) -> Result<()> {
             .temperature
             .map(|v| v.to_string())
             .unwrap_or_else(|| "<unset>".into())
+    );
+    println!(
+        "  summary_threshold: {} (0 = disabled)",
+        eff.config.agent.summary_threshold
+    );
+    println!("  summary_keep_tail: {}", eff.config.agent.summary_keep_tail);
+    println!(
+        "  vector_recall:     {} (top_k={}, min_score={})",
+        eff.config.agent.vector_recall,
+        eff.config.agent.vector_recall_top_k,
+        eff.config.agent.vector_recall_min_score,
     );
     println!();
     println!("[permissions]");
@@ -450,7 +461,7 @@ async fn cmd_memory_index(eff: &EffectiveCli, fact_store: Arc<dyn FactStore>) ->
             .embed(&texts)
             .await
             .map_err(|e| anyhow!("embed: {e}"))?;
-        for (fact, emb) in chunk.iter().zip(embeddings) {
+        for ((fact, emb), text) in chunk.iter().zip(embeddings).zip(texts.iter()) {
             let key = format!("fact:{}", fact.id);
             let metadata = serde_json::json!({
                 "fact_id": fact.id.as_str(),
@@ -458,7 +469,7 @@ async fn cmd_memory_index(eff: &EffectiveCli, fact_store: Arc<dyn FactStore>) ->
                 "kind": format_kind(fact.kind),
             });
             vectors
-                .upsert(&key, &texts[indexed % BATCH], emb, metadata)
+                .upsert(&key, text, emb, metadata)
                 .await
                 .map_err(|e| anyhow!("upsert: {e}"))?;
             indexed += 1;
@@ -466,6 +477,28 @@ async fn cmd_memory_index(eff: &EffectiveCli, fact_store: Arc<dyn FactStore>) ->
     }
     println!("Indexed {indexed} fact(s).");
     Ok(())
+}
+
+/// 构造可选的 `VectorRecallPromptProvider`：仅在 `OPENAI_API_KEY` 可用且
+/// 向量表非空时返回 `Some`，否则返回 `None`（语义召回静默跳过，不破坏正常聊天）。
+async fn build_vector_recall(
+    eff: &EffectiveCli,
+) -> Result<Option<Arc<dyn PromptProvider>>> {
+    let Ok(key) = std::env::var("OPENAI_API_KEY") else {
+        return Ok(None);
+    };
+    let embedder: Arc<dyn EmbeddingProvider> = Arc::new(
+        OpenAiEmbeddingProvider::new(key).map_err(|e| anyhow!("embedder init: {e}"))?,
+    );
+    let store = open_session_store_concrete(eff).await?;
+    let vectors: Arc<dyn VectorStore> = Arc::new(SimpleVectorStore::from_session_store(&store));
+    if vectors.is_empty().await.unwrap_or(true) {
+        return Ok(None);
+    }
+    let provider = VectorRecallPromptProvider::new(embedder, vectors)
+        .with_top_k(eff.config.agent.vector_recall_top_k)
+        .with_min_score(eff.config.agent.vector_recall_min_score);
+    Ok(Some(Arc::new(provider)))
 }
 
 async fn open_session_store_concrete(eff: &EffectiveCli) -> Result<SqliteSessionStore> {
@@ -772,6 +805,20 @@ async fn build_bundle(eff: &EffectiveCli) -> Result<AgentBundle> {
         chain.push(Arc::new(augmenter));
     }
     chain.push(Arc::new(facts_provider));
+
+    // 语义召回（可选）：开启后每轮先 embed 用户输入，再从 SQLite 向量表
+    // 拉 top-k 注入到 system prompt。需要先跑 `agent memory index`。
+    if eff.config.agent.vector_recall {
+        match build_vector_recall(eff).await {
+            Ok(Some(provider)) => chain.push(provider),
+            Ok(None) => {
+                eprintln!(
+                    "[note] vector_recall enabled but skipped (vector store empty or embedder unavailable; run `agent memory index` and set OPENAI_API_KEY)"
+                );
+            }
+            Err(e) => eprintln!("[warning] vector_recall init failed: {e}"),
+        }
+    }
 
     let candidate_queue = open_candidate_queue(&config_dir);
 
