@@ -13,6 +13,14 @@ pub trait PromptProvider: Send + Sync {
     /// Return any additional system-prompt content to inject for this turn.
     /// Empty string means "nothing to add".
     async fn system_prompt_for(&self, input: &str) -> String;
+
+    /// Tools the runtime is allowed to dispatch for this turn. `None` means
+    /// "no restriction" (the default); `Some(list)` confines the model to
+    /// `list` (plus the runtime's always-on infrastructure tools). Skills
+    /// declaring `tools_allowed` drive this.
+    async fn tool_whitelist_for(&self, _input: &str) -> Option<Vec<String>> {
+        None
+    }
 }
 
 /// Compose multiple providers into one. Their outputs are concatenated in
@@ -53,5 +61,23 @@ impl PromptProvider for ChainedPromptProvider {
             }
         }
         parts.join("\n\n")
+    }
+
+    /// Union of every child's whitelist. If no child restricts, returns
+    /// `None`; otherwise the de-duplicated union of all `Some` lists.
+    async fn tool_whitelist_for(&self, input: &str) -> Option<Vec<String>> {
+        let mut union: Vec<String> = Vec::new();
+        let mut any = false;
+        for p in &self.inner {
+            if let Some(list) = p.tool_whitelist_for(input).await {
+                any = true;
+                for t in list {
+                    if !union.contains(&t) {
+                        union.push(t);
+                    }
+                }
+            }
+        }
+        any.then_some(union)
     }
 }

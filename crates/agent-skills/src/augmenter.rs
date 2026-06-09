@@ -44,4 +44,24 @@ impl PromptProvider for Augmenter {
         }
         parts.join("\n\n")
     }
+
+    /// Union of `tools_allowed` across the skills triggered by `input`. Only
+    /// skills that declare a non-empty list contribute; if none do, returns
+    /// `None` (no restriction).
+    async fn tool_whitelist_for(&self, input: &str) -> Option<Vec<String>> {
+        let mut union: Vec<String> = Vec::new();
+        let mut any = false;
+        for skill in self.skills.match_for(input) {
+            if skill.tools_allowed.is_empty() {
+                continue;
+            }
+            any = true;
+            for t in &skill.tools_allowed {
+                if !union.contains(t) {
+                    union.push(t.clone());
+                }
+            }
+        }
+        any.then_some(union)
+    }
 }

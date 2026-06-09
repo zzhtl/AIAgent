@@ -398,7 +398,12 @@ impl StreamState {
                 out.push(LlmEvent::ToolCallReady { index: idx, id, name, arguments });
             }
         }
-        if let Some(u) = self.usage.take() {
+        if let Some(mut u) = self.usage.take() {
+            // Normalise to the "cached ⊆ prompt" invariant the rest of the
+            // stack assumes: Anthropic reports `input_tokens` *excluding*
+            // cache reads, so fold the cache-read count back into the prompt
+            // total. (OpenAI already includes cached in prompt_tokens.)
+            u.prompt_tokens = u.prompt_tokens.saturating_add(u.cached_tokens);
             out.push(LlmEvent::Usage(u));
         }
         out.push(LlmEvent::End(self.stop_reason.unwrap_or(StopReason::EndTurn)));

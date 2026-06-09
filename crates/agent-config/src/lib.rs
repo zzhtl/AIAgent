@@ -85,6 +85,15 @@ pub struct LoopConfig {
     pub vector_recall: bool,
     pub vector_recall_top_k: usize,
     pub vector_recall_min_score: f32,
+    /// Max automatic retries for transient LLM errors (network / rate-limit /
+    /// 5xx) before the turn aborts. `0` disables retrying.
+    pub max_retries: u32,
+    /// Base backoff (ms) for retries; the delay grows exponentially
+    /// (`base * 2^attempt`) unless the provider supplies a `Retry-After`.
+    pub retry_base_delay_ms: u64,
+    /// Cumulative token budget for a single turn across all loop steps.
+    /// When the running total reaches it the loop stops. `None` = unlimited.
+    pub token_budget: Option<u32>,
 }
 
 impl Default for LoopConfig {
@@ -98,6 +107,9 @@ impl Default for LoopConfig {
             vector_recall: false,
             vector_recall_top_k: 5,
             vector_recall_min_score: 0.2,
+            max_retries: 2,
+            retry_base_delay_ms: 500,
+            token_budget: None,
         }
     }
 }

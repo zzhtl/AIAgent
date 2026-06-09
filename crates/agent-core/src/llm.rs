@@ -33,6 +33,28 @@ pub enum LlmError {
     Unsupported(String),
 }
 
+impl LlmError {
+    /// Whether retrying the request stands a chance of succeeding. Transient
+    /// transport failures (`Network`, `RateLimited`) and 5xx provider errors
+    /// are retryable; auth / bad-request / unsupported are not.
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            LlmError::Network(_) | LlmError::RateLimited { .. } => true,
+            LlmError::Provider { status, .. } => *status >= 500,
+            LlmError::Auth(_) | LlmError::InvalidResponse(_) | LlmError::Unsupported(_) => false,
+        }
+    }
+
+    /// Suggested wait before a retry, if the provider gave one
+    /// (`Retry-After` on rate limits). `None` ⇒ use the caller's backoff.
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        match self {
+            LlmError::RateLimited { retry_after_secs } => *retry_after_secs,
+            _ => None,
+        }
+    }
+}
+
 pub type LlmResult<T> = std::result::Result<T, LlmError>;
 
 /// Capability flags advertised by a provider so the runtime can degrade
@@ -142,4 +164,26 @@ pub trait LlmProvider: Send + Sync {
     fn capabilities(&self) -> ProviderCapabilities;
 
     async fn chat_stream(&self, request: ChatRequest) -> LlmResult<LlmEventStream>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retryable_classification() {
+        assert!(LlmError::Network("timeout".into()).is_retryable());
+        assert!(LlmError::RateLimited { retry_after_secs: Some(2) }.is_retryable());
+        assert!(LlmError::Provider { status: 503, message: "down".into() }.is_retryable());
+        assert!(!LlmError::Provider { status: 400, message: "bad".into() }.is_retryable());
+        assert!(!LlmError::Auth("bad key".into()).is_retryable());
+        assert!(!LlmError::InvalidResponse("garbage".into()).is_retryable());
+        assert!(!LlmError::Unsupported("nope".into()).is_retryable());
+    }
+
+    #[test]
+    fn retry_after_only_for_rate_limit() {
+        assert_eq!(LlmError::RateLimited { retry_after_secs: Some(5) }.retry_after_secs(), Some(5));
+        assert_eq!(LlmError::Network("x".into()).retry_after_secs(), None);
+    }
 }

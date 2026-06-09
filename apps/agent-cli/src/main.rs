@@ -1,5 +1,6 @@
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -86,6 +87,12 @@ impl EffectiveCli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Scaffold the config directory (config.toml + example skill/rule).
+    Init {
+        /// Overwrite files that already exist.
+        #[arg(long)]
+        force: bool,
+    },
     /// Start an interactive REPL chat.
     Chat,
     /// Run a single prompt and exit.
@@ -164,6 +171,7 @@ async fn main() -> Result<()> {
     let cmd = cli.command.take();
     let eff = EffectiveCli::from(&cli)?;
     match cmd {
+        Some(Command::Init { force }) => cmd_init(&eff, force),
         Some(Command::Chat) => cmd_chat(&eff).await,
         Some(Command::Run { prompt }) => cmd_run(&eff, prompt).await,
         Some(Command::Sessions { limit }) => cmd_sessions(&eff, limit).await,
@@ -219,6 +227,18 @@ fn cmd_config(eff: &EffectiveCli) -> Result<()> {
         eff.config.agent.vector_recall_top_k,
         eff.config.agent.vector_recall_min_score,
     );
+    println!(
+        "  max_retries:       {} (base_delay={}ms)",
+        eff.config.agent.max_retries, eff.config.agent.retry_base_delay_ms,
+    );
+    println!(
+        "  token_budget:      {}",
+        eff.config
+            .agent
+            .token_budget
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "<unset>".into())
+    );
     println!();
     println!("[permissions]");
     println!("  allow_read:       {}", eff.config.permissions.allow_read);
@@ -229,6 +249,140 @@ fn cmd_config(eff: &EffectiveCli) -> Result<()> {
         "  max_runtime_secs: {}",
         eff.config.permissions.max_runtime_secs
     );
+    Ok(())
+}
+
+const CONFIG_TEMPLATE: &str = r#"# AIAgent 配置文件
+# 解析顺序（后者覆盖前者）：内置默认 → /etc/agent/config.toml →
+# ~/.config/agent/config.toml（本文件）→ ./agent.toml → AGENT_* 环境变量。
+# API key 永远不从配置读取，只从环境变量取（见文件末尾）。
+
+# provider: openai | deepseek | claude/anthropic
+provider = "openai"
+# model：留空用 provider 默认（openai=gpt-4o-mini, deepseek=deepseek-chat,
+# claude=claude-sonnet-4-5）。
+# model = "gpt-4o-mini"
+no_tools = false   # true = 纯文本模式，禁用所有工具
+evolve = false     # true = 每轮后自动反思一条记忆（多一次 LLM 调用）
+
+[agent]
+max_steps = 12              # 单轮 think→tool 循环步数上限
+# max_tokens = 4096         # 每次 LLM 请求的最大输出 token
+# temperature = 0.7
+summary_threshold = 30      # 历史超过该条数时压缩早期消息；0 关闭
+summary_keep_tail = 8       # 压缩时保留最近多少条原文
+vector_recall = false       # 语义召回（需 OPENAI_API_KEY + 先跑 `agent memory index`）
+vector_recall_top_k = 5
+vector_recall_min_score = 0.2
+max_retries = 2             # LLM 瞬时错误（网络/限流/5xx）自动重试次数
+retry_base_delay_ms = 500   # 重试退避基数，按 base*2^n 增长
+# token_budget = 100000     # 单轮累计 token 预算，超出即停止
+
+[permissions]
+allow_read = true
+allow_write = true
+allow_shell = true
+allow_network = true
+max_runtime_secs = 120      # bash 等长任务的硬超时（秒）
+
+# API key（按所选 provider 设置对应环境变量，不要写进本文件）：
+#   openai   → export OPENAI_API_KEY=...
+#   deepseek → export DEEPSEEK_API_KEY=...
+#   claude   → export ANTHROPIC_API_KEY=...
+"#;
+
+const SKILL_TEMPLATE: &str = r#"---
+name: code-review
+description: 系统化代码审查流程
+triggers:
+  - review
+  - 代码审查
+  - code review
+  - 审查代码
+tools_allowed:
+  - file_read
+  - bash
+---
+
+# Code Review 工作流
+
+当用户要求审查代码时，按以下步骤执行：
+
+## 步骤
+
+1. **定位目标**：用 `file_read` 读取用户指定的文件（如未指定，先列出当前目录）
+2. **结构分析**：识别函数 / 模块边界，标记入口与关键路径
+3. **检查清单**：
+   - 命名与可读性
+   - 错误处理是否完整（特别是边界条件）
+   - 资源管理（文件、连接、锁）
+   - 并发安全（如涉及）
+   - 测试覆盖（是否易测、是否有死代码）
+4. **输出格式**：分 high / medium / low 三档列出问题
+   - 每条问题给出 `file:line` 锚点（如能确定）
+   - 给出一条具体修复建议（不要泛泛而谈）
+
+## 重要
+
+- 不要直接修改文件，只输出建议
+- 如需运行编译/测试验证，用 `bash` 工具
+"#;
+
+const RULE_TEMPLATE: &str = r#"---
+name: coding-style
+---
+
+# 全局编码风格
+
+- 默认中文交流，称呼用户 zzhtl
+- 代码注释优先跟随仓库现状：英文项目用英文注释
+- 写代码追求最小变更，不主动重构无关代码
+- 公共 API 必须有 doc 注释
+- 错误优先用 `?` 操作符；避免 `unwrap()` 在非测试代码中
+- 公开变更前简明说明 what + why
+"#;
+
+/// Scaffold the config directory: create the standard subdirectories and drop
+/// a commented `config.toml` plus one starter skill / rule so a fresh install
+/// has a working baseline. Existing files are skipped unless `--force`.
+fn cmd_init(eff: &EffectiveCli, force: bool) -> Result<()> {
+    let dir = eff.config_dir.clone();
+    for sub in ["", "skills", "rules", "memory", "evolution"] {
+        let p = if sub.is_empty() { dir.clone() } else { dir.join(sub) };
+        std::fs::create_dir_all(&p).with_context(|| format!("create_dir_all {}", p.display()))?;
+    }
+
+    let files = [
+        (dir.join("config.toml"), CONFIG_TEMPLATE),
+        (dir.join("skills").join("code-review.md"), SKILL_TEMPLATE),
+        (dir.join("rules").join("coding-style.md"), RULE_TEMPLATE),
+    ];
+    let mut wrote = 0usize;
+    let mut skipped = 0usize;
+    for (path, content) in files {
+        if path.exists() && !force {
+            println!("  skip (exists): {}", path.display());
+            skipped += 1;
+            continue;
+        }
+        std::fs::write(&path, content).with_context(|| format!("write {}", path.display()))?;
+        println!("  wrote: {}", path.display());
+        wrote += 1;
+    }
+
+    println!();
+    println!("Initialized config at {}", dir.display());
+    println!("  {wrote} file(s) written, {skipped} skipped.");
+    if skipped > 0 && !force {
+        println!("  Re-run with --force to overwrite skipped files.");
+    }
+    println!();
+    println!("Next steps:");
+    println!("  1. 设置 API key（按 provider 选一个）：");
+    println!("       export OPENAI_API_KEY=...      # openai");
+    println!("       export DEEPSEEK_API_KEY=...    # deepseek");
+    println!("       export ANTHROPIC_API_KEY=...   # claude");
+    println!("  2. 运行：agent chat");
     Ok(())
 }
 
@@ -644,10 +798,37 @@ async fn drive(
     input: UserInput,
 ) -> Result<Vec<Message>> {
     history = maybe_compact_history(bundle, sid, history).await;
-    let mut stream = bundle.agent.run(sid.clone(), history.clone(), input);
+    // Ctrl-C during a turn flips this flag; the agent loop observes it at its
+    // next checkpoint and ends gracefully with `StopReason::Cancelled`.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut stream =
+        bundle
+            .agent
+            .run_cancellable(sid.clone(), history.clone(), input, cancel.clone());
     let mut pending_usages: Vec<(String, TokenUsage)> = Vec::new();
+    let mut cancelling = false;
 
-    while let Some(event) = stream.next().await {
+    loop {
+        let event = if cancelling {
+            // Already signalled; just drain remaining events to the `Done`.
+            match stream.next().await {
+                Some(e) => e,
+                None => break,
+            }
+        } else {
+            tokio::select! {
+                ev = stream.next() => match ev {
+                    Some(e) => e,
+                    None => break,
+                },
+                _ = tokio::signal::ctrl_c() => {
+                    cancel.store(true, Ordering::Relaxed);
+                    cancelling = true;
+                    eprintln!("\n[cancelling…]");
+                    continue;
+                }
+            }
+        };
         match event {
             AgentEvent::TextDelta { delta } => {
                 print!("{delta}");
@@ -682,6 +863,14 @@ async fn drive(
                         eprintln!(
                             "\n[note] reached the agent loop cap (max_steps); some work may be incomplete"
                         );
+                    }
+                    StopReason::BudgetExceeded => {
+                        eprintln!(
+                            "\n[note] stopped: per-turn token_budget exhausted; some work may be incomplete"
+                        );
+                    }
+                    StopReason::Cancelled => {
+                        eprintln!("\n[note] cancelled by user; partial work saved");
                     }
                     _ => {}
                 }
@@ -827,6 +1016,9 @@ async fn build_bundle(eff: &EffectiveCli) -> Result<AgentBundle> {
         temperature: eff.config.agent.temperature,
         max_tokens: eff.config.agent.max_tokens,
         permissions: eff.config.permissions.to_runtime(),
+        max_retries: eff.config.agent.max_retries,
+        retry_base_delay_ms: eff.config.agent.retry_base_delay_ms,
+        token_budget: eff.config.agent.token_budget,
     };
 
     let mut builder = Agent::builder()

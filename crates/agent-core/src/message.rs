@@ -100,6 +100,9 @@ pub enum StopReason {
     /// `end_turn`. Distinct from `MaxTokens` (which is the model's own
     /// length-limit signal) so the CLI can render a clearer message.
     MaxSteps,
+    /// The cumulative per-turn `token_budget` was exhausted; the loop stopped
+    /// itself before the model signalled `end_turn`.
+    BudgetExceeded,
     Cancelled,
     Error,
 }
