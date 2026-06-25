@@ -12,6 +12,7 @@ use std::sync::Arc;
 use agent_core::tool::{Tool, ToolRegistry};
 
 pub mod builtin;
+pub mod policy;
 
 /// Core built-ins: `file_read`, `file_edit`, `bash`, `grep`, `glob`,
 /// `fetch`. These never touch the fact store and work without one.

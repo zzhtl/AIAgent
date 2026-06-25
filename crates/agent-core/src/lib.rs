@@ -11,13 +11,16 @@ pub mod agent;
 pub mod channel;
 pub mod error;
 pub mod evolution;
+pub mod extensions;
 pub mod frontmatter;
+pub mod hook;
 pub mod llm;
 pub mod memory;
 pub mod message;
 pub mod prompt;
 pub mod session;
 pub mod store;
+pub mod subagent;
 pub mod text;
 pub mod tool;
 
@@ -38,7 +41,10 @@ pub use tool::{
 
 pub use agent::{Agent, AgentBuilder, RunConfig};
 pub use prompt::{ChainedPromptProvider, PromptProvider};
+pub use subagent::{SubAgentDepth, SubAgentTool};
 pub use evolution::{Candidate, CandidateError, CandidateKind, CandidateQueue};
+pub use extensions::Extensions;
+pub use hook::{AgentHook, ChainedHook, HookDecision};
 pub use memory::{
     EmbeddingProvider, Fact, FactId, FactKind, FactStore, MemoryError, MemoryHit, MemoryResult,
     NewFact, VectorStore,

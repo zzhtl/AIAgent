@@ -1,15 +1,15 @@
 [package]
-name = "agent-cli"
+name = "agent-web"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "Command-line front-end for the AI agent runtime."
+description = "HTTP/SSE web entry for the AI agent runtime."
 
 [[bin]]
-name = "agent"
+name = "agent-web"
 path = "src/main.rs"
 
 [dependencies]
@@ -18,15 +18,12 @@ agent-llm       = { workspace = true }
 agent-tools     = { workspace = true }
 agent-skills    = { workspace = true }
 agent-memory    = { workspace = true }
-agent-config    = { workspace = true }
 agent-telemetry = { workspace = true }
-agent-evolution = { workspace = true }
-agent-mcp       = { workspace = true }
-serde_json      = { workspace = true }
-
-anyhow  = { workspace = true }
-clap    = { workspace = true }
-tokio   = { workspace = true }
-tracing = { workspace = true }
-futures = { workspace = true }
-chrono  = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+anyhow       = { workspace = true }
+tokio        = { workspace = true }
+tracing      = { workspace = true }
+futures      = { workspace = true }
+async-stream = { workspace = true }
+axum         = { workspace = true }

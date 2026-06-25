@@ -10,9 +10,11 @@
 //! Candidate data types and the JSON queue live in `agent-core::evolution`
 //! so tools (`agent-tools`) can enqueue without depending on this crate.
 
+pub mod extractor;
 pub mod reflection;
 pub mod summariser;
 
 pub use agent_core::evolution::{Candidate, CandidateError, CandidateKind, CandidateQueue};
+pub use extractor::Extractor;
 pub use reflection::Reflector;
 pub use summariser::Summariser;

@@ -8,18 +8,21 @@ use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use agent_config::AgentConfig;
+use agent_config::{AgentConfig, McpServerConfig, SubAgentConfig, ToolPolicyConfig};
+use agent_mcp::{McpClient, McpTool};
+use agent_tools::policy::{PolicyHook, ToolAccess, ToolPolicy};
 use agent_core::agent::RunConfig;
 use agent_core::evolution::{CandidateKind, CandidateQueue};
 use agent_core::{
     Agent, AgentEvent, ChainedPromptProvider, FactId, FactKind, FactStore, LlmProvider, Message,
-    NewFact, PromptProvider, SessionId, SessionStore, StopReason, TokenUsage, ToolRegistry,
-    UserInput,
+    NewFact, PromptProvider, SessionId, SessionStore, StopReason, SubAgentTool, TokenUsage,
+    ToolRegistry, UserInput,
 };
-use agent_evolution::{Reflector, Summariser};
+use agent_evolution::{Extractor, Reflector, Summariser};
 use agent_core::memory::{EmbeddingProvider, VectorStore};
 use agent_llm::providers::anthropic::{AnthropicConfig, AnthropicProvider};
 use agent_llm::providers::openai::{OpenAiConfig, OpenAiProvider};
+use agent_llm::ProviderRegistry;
 use agent_llm::providers::openai_embeddings::OpenAiEmbeddingProvider;
 use agent_memory::{
     FactsPromptProvider, MarkdownFactStore, SimpleVectorStore, SqliteSessionStore,
@@ -131,6 +134,9 @@ enum EvolutionCmd {
     Apply { id: String },
     /// Drop a candidate without applying.
     Reject { id: String },
+    /// Mine accumulated reflections for rule/skill candidates (uses the LLM);
+    /// proposals land in the same review queue.
+    Extract,
 }
 
 #[derive(Subcommand)]
@@ -289,6 +295,32 @@ max_runtime_secs = 120      # bash 等长任务的硬超时（秒）
 #   openai   → export OPENAI_API_KEY=...
 #   deepseek → export DEEPSEEK_API_KEY=...
 #   claude   → export ANTHROPIC_API_KEY=...
+
+# 子 agent（可选）：声明后会作为工具暴露给主 agent，由主 agent 自行决定何时委派。
+# 每个子 agent 复用主 provider、继承权限，但可独立设置 model / 系统提示 / 步数上限。
+# [[subagents]]
+# name = "researcher"                      # 工具名（主 agent 用它调用，需唯一）
+# description = "深入研究某个主题并给出结论"  # 主 agent 看到的用途说明
+# prompt = "你是研究专家，检索并综合信息后给出有依据的结论。"
+# model = "gpt-4o"                         # 可选，留空则用主 model
+# max_steps = 8                            # 可选，留空则用主 max_steps
+
+# MCP 服务（可选）：启动时通过 stdio 连接，把服务暴露的工具注册进来（名字加
+# 前缀 <name>__<tool> 防冲突）。连接失败会告警并跳过，不影响启动。
+# [[mcp_servers]]
+# name = "fs"                              # 工具名前缀（需唯一）
+# command = "npx"                          # 启动 MCP server 的可执行文件
+# args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+# [mcp_servers.env]                        # 可选，传给 server 进程的环境变量
+# SOME_TOKEN = "..."
+
+# 工具访问策略 / 沙箱（可选）：默认放开所有工具。不信任 / 多租户场景可收紧。
+# 仅在确实有限制时才会启用（before_tool hook 拦截），否则零开销。
+# [tool_policy]
+# default_allow = true                     # 未列出的工具默认是否允许
+# deny = ["bash"]                          # 显式拒绝的工具
+# allow = []                               # 显式允许（配合 default_allow=false 做白名单）
+# bash_allowed_prefixes = ["ls", "cat", "git "]  # 非空时 bash 命令必须以其一开头
 "#;
 
 const SKILL_TEMPLATE: &str = r#"---
@@ -724,6 +756,25 @@ async fn cmd_evolution(eff: &EffectiveCli, action: EvolutionCmd) -> Result<()> {
                 None => return Err(anyhow!("no candidate with id `{id}`")),
             }
         }
+        EvolutionCmd::Extract => {
+            let (provider, model) = build_provider(eff)?;
+            let fact_store: Arc<dyn FactStore> =
+                Arc::new(MarkdownFactStore::open(config_dir.join("memory")));
+            let candidates = Extractor::new(provider, model, fact_store).extract().await;
+            if candidates.is_empty() {
+                println!(
+                    "No candidates extracted (need ≥3 reflections and a recurring pattern)."
+                );
+                return Ok(());
+            }
+            let n = candidates.len();
+            for c in candidates {
+                queue.enqueue(c).await.map_err(|e| anyhow!("enqueue: {e}"))?;
+            }
+            println!(
+                "Extracted {n} candidate(s) → `agent evolution review` to inspect, `apply <id>` to install."
+            );
+        }
     }
     Ok(())
 }
@@ -973,6 +1024,26 @@ async fn build_bundle(eff: &EffectiveCli) -> Result<AgentBundle> {
         agent_tools::register_builtins(&mut tools);
         agent_tools::register_memory_tools(&mut tools);
         agent_tools::register_evolution_tools(&mut tools);
+        // Register declared sub-agents as callable tools. Each reuses the main
+        // provider but gets its own model / system prompt; its tool-set is the
+        // built-ins only (no nested sub-agents), so the call graph can't recurse.
+        for sub in &eff.config.subagents {
+            let sub_agent = build_subagent(eff, &provider, &model, sub)?;
+            tools.register(Arc::new(SubAgentTool::new(
+                sub.name.clone(),
+                sub.description.clone(),
+                sub_agent,
+            )));
+        }
+        // Connect declared MCP servers and register their tools (namespaced by
+        // server name). A server that fails to start is logged and skipped so
+        // one bad entry doesn't abort startup.
+        for srv in &eff.config.mcp_servers {
+            match register_mcp_server(&mut tools, srv).await {
+                Ok(n) => tracing::info!("mcp `{}`: registered {n} tool(s)", srv.name),
+                Err(e) => eprintln!("[warning] mcp server `{}` skipped: {e}", srv.name),
+            }
+        }
     }
 
     let config_dir = eff.config_dir.clone();
@@ -1033,6 +1104,12 @@ async fn build_bundle(eff: &EffectiveCli) -> Result<AgentBundle> {
         let provider_arc: Arc<dyn PromptProvider> = Arc::new(chain);
         builder = builder.with_prompt_provider(provider_arc);
     }
+    // Install the tool-access policy as a before_tool hook, but only when it
+    // actually restricts something (zero overhead otherwise).
+    let policy = tool_policy_from_config(&eff.config.tool_policy);
+    if !policy.is_unrestricted() {
+        builder = builder.with_hook(Arc::new(PolicyHook::new(policy)));
+    }
     let agent = builder.build().map_err(|e| anyhow!("agent builder: {e}"))?;
 
     let reflector = if eff.evolve {
@@ -1063,42 +1140,135 @@ async fn build_bundle(eff: &EffectiveCli) -> Result<AgentBundle> {
     })
 }
 
+/// Build one declared sub-agent: reuses the main provider, inherits the main
+/// permissions/workspace, but takes its own model / system prompt / step cap.
+/// Its tool-set is the built-ins only — no memory, evolution, or nested
+/// sub-agent tools — so it stays focused and the call graph cannot recurse.
+fn build_subagent(
+    eff: &EffectiveCli,
+    provider: &Arc<dyn LlmProvider>,
+    main_model: &str,
+    sub: &SubAgentConfig,
+) -> Result<Agent> {
+    let mut sub_tools = ToolRegistry::new();
+    agent_tools::register_builtins(&mut sub_tools);
+
+    let run_config = RunConfig {
+        max_steps: sub.max_steps.unwrap_or(eff.config.agent.max_steps),
+        permissions: eff.config.permissions.to_runtime(),
+        ..RunConfig::default()
+    };
+
+    let mut builder = Agent::builder()
+        .with_llm(provider.clone())
+        .with_model(sub.model.clone().unwrap_or_else(|| main_model.to_string()))
+        .with_tools(sub_tools)
+        .with_config(run_config)
+        .with_workspace(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    if let Some(p) = &sub.prompt {
+        builder = builder.with_system_prompt(p.clone());
+    }
+    builder.build().map_err(|e| anyhow!("subagent `{}`: {e}", sub.name))
+}
+
+/// Translate the declarative `[tool_policy]` config into a runtime `ToolPolicy`.
+fn tool_policy_from_config(cfg: &ToolPolicyConfig) -> ToolPolicy {
+    let default = if cfg.default_allow { ToolAccess::Allow } else { ToolAccess::Deny };
+    let mut policy =
+        ToolPolicy::new(default).with_bash_allowed_prefixes(cfg.bash_allowed_prefixes.clone());
+    for t in &cfg.deny {
+        policy = policy.deny(t.clone());
+    }
+    for t in &cfg.allow {
+        policy = policy.allow(t.clone());
+    }
+    policy
+}
+
+/// Connect one MCP server over stdio, list its tools, and register each as a
+/// namespaced `McpTool` (`<server>__<tool>`). Returns the number registered.
+async fn register_mcp_server(tools: &mut ToolRegistry, srv: &McpServerConfig) -> Result<usize> {
+    let env: Vec<(String, String)> =
+        srv.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let client = McpClient::connect_stdio(&srv.command, &srv.args, &env)
+        .await
+        .map_err(|e| anyhow!("connect: {e}"))?;
+    let defs = client.list_tools().await.map_err(|e| anyhow!("list_tools: {e}"))?;
+    let count = defs.len();
+    for def in defs {
+        let exposed = format!("{}__{}", srv.name, def.name);
+        tools.register(Arc::new(McpTool::new(
+            client.clone(),
+            exposed,
+            def.name,
+            def.description,
+            def.input_schema,
+        )));
+    }
+    Ok(count)
+}
+
 fn build_provider(eff: &EffectiveCli) -> Result<(Arc<dyn LlmProvider>, String)> {
     let provider_id = eff.provider.to_ascii_lowercase();
-    match provider_id.as_str() {
-        "openai" => {
-            let key = std::env::var("OPENAI_API_KEY").context("OPENAI_API_KEY is not set")?;
-            let model = eff.model.clone().unwrap_or_else(|| "gpt-4o-mini".into());
-            let provider: Arc<dyn LlmProvider> = Arc::new(
-                OpenAiProvider::new(OpenAiConfig::openai(key))
-                    .map_err(|e| anyhow!("provider init: {e}"))?,
-            );
-            Ok((provider, model))
-        }
-        "deepseek" => {
-            let key = std::env::var("DEEPSEEK_API_KEY").context("DEEPSEEK_API_KEY is not set")?;
-            let model = eff.model.clone().unwrap_or_else(|| "deepseek-chat".into());
-            let provider: Arc<dyn LlmProvider> = Arc::new(
-                OpenAiProvider::new(OpenAiConfig::deepseek(key))
-                    .map_err(|e| anyhow!("provider init: {e}"))?,
-            );
-            Ok((provider, model))
-        }
-        "claude" | "anthropic" => {
-            let key = std::env::var("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY is not set")?;
-            let model = eff
-                .model
-                .clone()
-                .unwrap_or_else(|| "claude-sonnet-4-5".into());
-            let provider: Arc<dyn LlmProvider> = Arc::new(
-                AnthropicProvider::new(AnthropicConfig::new(key))
-                    .map_err(|e| anyhow!("provider init: {e}"))?,
-            );
-            Ok((provider, model))
-        }
-        other => Err(anyhow!(
-            "unsupported provider `{other}` (expected `openai`, `deepseek`, or `claude`)"
-        )),
+
+    // Resolve the provider through a registry of lazy factories: only the
+    // selected provider is constructed, so only its API key must be present.
+    // This is the seam for registering additional providers later.
+    let mut registry = ProviderRegistry::new();
+    register_builtin_providers(&mut registry);
+
+    let provider = registry
+        .build(&provider_id)
+        .ok_or_else(|| {
+            anyhow!(
+                "unsupported provider `{provider_id}` (expected `openai`, `deepseek`, or `claude`)"
+            )
+        })?
+        .map_err(|e| anyhow!("{e}"))?;
+
+    let model = eff
+        .model
+        .clone()
+        .unwrap_or_else(|| default_model_for(&provider_id).to_string());
+
+    Ok((provider, model))
+}
+
+/// Register the built-in providers as lazy factories. Each reads its API key
+/// from the environment only when selected; the error wording matches the
+/// previous hard-coded branches exactly.
+fn register_builtin_providers(registry: &mut ProviderRegistry) {
+    registry.register_factory("openai", || {
+        let key =
+            std::env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY is not set".to_string())?;
+        let p = OpenAiProvider::new(OpenAiConfig::openai(key))
+            .map_err(|e| format!("provider init: {e}"))?;
+        Ok(Arc::new(p) as Arc<dyn LlmProvider>)
+    });
+    registry.register_factory("deepseek", || {
+        let key = std::env::var("DEEPSEEK_API_KEY")
+            .map_err(|_| "DEEPSEEK_API_KEY is not set".to_string())?;
+        let p = OpenAiProvider::new(OpenAiConfig::deepseek(key))
+            .map_err(|e| format!("provider init: {e}"))?;
+        Ok(Arc::new(p) as Arc<dyn LlmProvider>)
+    });
+    for name in ["claude", "anthropic"] {
+        registry.register_factory(name, || {
+            let key = std::env::var("ANTHROPIC_API_KEY")
+                .map_err(|_| "ANTHROPIC_API_KEY is not set".to_string())?;
+            let p = AnthropicProvider::new(AnthropicConfig::new(key))
+                .map_err(|e| format!("provider init: {e}"))?;
+            Ok(Arc::new(p) as Arc<dyn LlmProvider>)
+        });
+    }
+}
+
+/// Provider-specific default model when the user didn't pin one with `--model`.
+fn default_model_for(provider_id: &str) -> &'static str {
+    match provider_id {
+        "deepseek" => "deepseek-chat",
+        "claude" | "anthropic" => "claude-sonnet-4-5",
+        _ => "gpt-4o-mini",
     }
 }
 

@@ -9,8 +9,10 @@ members = [
     "crates/agent-evolution",
     "crates/agent-config",
     "crates/agent-telemetry",
+    "crates/agent-mcp",
     "apps/agent-cli",
     "apps/agent-bot",
+    "apps/agent-web",
 ]
 
 [workspace.package]
@@ -31,6 +33,7 @@ agent-memory    = { path = "crates/agent-memory" }
 agent-config    = { path = "crates/agent-config" }
 agent-telemetry = { path = "crates/agent-telemetry" }
 agent-evolution = { path = "crates/agent-evolution" }
+agent-mcp       = { path = "crates/agent-mcp" }
 
 # 异步运行时与流
 tokio        = { version = "1", features = ["full"] }
@@ -51,6 +54,9 @@ thiserror          = "1"
 anyhow             = "1"
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Web 入口
+axum = "0.7"
 
 # CLI 与 REPL
 clap      = { version = "4", features = ["derive", "env"] }

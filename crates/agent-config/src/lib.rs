@@ -48,6 +48,18 @@ pub struct AgentConfig {
     pub config_dir: Option<PathBuf>,
     pub agent: LoopConfig,
     pub permissions: PermissionsConfig,
+    /// Specialist sub-agents exposed to the main agent as callable tools. Each
+    /// entry becomes a `SubAgentTool`. Empty by default.
+    #[serde(default)]
+    pub subagents: Vec<SubAgentConfig>,
+    /// MCP servers to connect on startup; each server's tools are registered
+    /// alongside the built-ins. Empty by default.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
+    /// Tool access policy (sandbox). Default allows everything; tighten it for
+    /// untrusted / multi-tenant deployments.
+    #[serde(default)]
+    pub tool_policy: ToolPolicyConfig,
 }
 
 impl Default for AgentConfig {
@@ -60,8 +72,76 @@ impl Default for AgentConfig {
             config_dir: None,
             agent: LoopConfig::default(),
             permissions: PermissionsConfig::default(),
+            subagents: Vec::new(),
+            mcp_servers: Vec::new(),
+            tool_policy: ToolPolicyConfig::default(),
         }
     }
+}
+
+/// Tool access policy (sandbox). `default_allow` governs tools not named in
+/// `allow`/`deny`; a non-empty `bash_allowed_prefixes` further confines `bash`.
+/// Maps to `agent_tools::policy::ToolPolicy` at the application boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ToolPolicyConfig {
+    /// Default decision for tools not listed in `allow`/`deny`.
+    pub default_allow: bool,
+    /// Tools explicitly denied (override `default_allow`).
+    pub deny: Vec<String>,
+    /// Tools explicitly allowed (override `default_allow`).
+    pub allow: Vec<String>,
+    /// If non-empty, `bash` commands must start with one of these prefixes.
+    pub bash_allowed_prefixes: Vec<String>,
+}
+
+impl Default for ToolPolicyConfig {
+    fn default() -> Self {
+        Self {
+            default_allow: true,
+            deny: Vec::new(),
+            allow: Vec::new(),
+            bash_allowed_prefixes: Vec::new(),
+        }
+    }
+}
+
+/// An MCP server to spawn and connect over stdio. Its advertised tools are
+/// registered as agent tools, namespaced by `name`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpServerConfig {
+    /// Local identifier, used as a prefix so tool names stay unique.
+    pub name: String,
+    /// Executable to launch (e.g. `npx`, `uvx`, a path).
+    pub command: String,
+    /// Arguments passed to `command`.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Extra environment variables for the server process.
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// Declares a specialist sub-agent the main agent can call as a tool. The CLI
+/// builds one `Agent` per entry (reusing the main provider) and registers it as
+/// a `SubAgentTool` alongside the built-in tools.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SubAgentConfig {
+    /// Tool name the main agent calls. Should be unique and snake_case.
+    pub name: String,
+    /// Description shown to the main agent — when to delegate to this sub-agent.
+    pub description: String,
+    /// Model id for the sub-agent. `None` ⇒ reuse the main agent's model.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// System prompt defining the sub-agent's role / specialty.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Per-sub-agent step cap. `None` ⇒ reuse the main loop's `max_steps`.
+    #[serde(default)]
+    pub max_steps: Option<u32>,
 }
 
 /// Tunables for the agent run loop.
@@ -232,5 +312,82 @@ mod tests {
         let p = cfg.to_runtime();
         assert!(p.allow_read);
         assert_eq!(p.max_runtime_secs, 120);
+    }
+
+    #[test]
+    fn subagents_default_empty() {
+        assert!(AgentConfig::default().subagents.is_empty());
+    }
+
+    #[test]
+    fn subagents_parse_from_toml() {
+        let toml = r#"
+provider = "openai"
+
+[[subagents]]
+name = "researcher"
+description = "Researches topics in depth"
+model = "gpt-4o"
+prompt = "You are a research specialist."
+"#;
+        let cfg: AgentConfig = Figment::from(Serialized::defaults(AgentConfig::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .expect("parse subagents");
+        assert_eq!(cfg.subagents.len(), 1);
+        assert_eq!(cfg.subagents[0].name, "researcher");
+        assert_eq!(cfg.subagents[0].model.as_deref(), Some("gpt-4o"));
+        assert!(cfg.subagents[0].max_steps.is_none());
+    }
+
+    #[test]
+    fn mcp_servers_parse_from_toml() {
+        let toml = r#"
+provider = "openai"
+
+[[mcp_servers]]
+name = "fs"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+[mcp_servers.env]
+FOO = "bar"
+"#;
+        let cfg: AgentConfig = Figment::from(Serialized::defaults(AgentConfig::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .expect("parse mcp_servers");
+        assert_eq!(cfg.mcp_servers.len(), 1);
+        assert_eq!(cfg.mcp_servers[0].name, "fs");
+        assert_eq!(cfg.mcp_servers[0].command, "npx");
+        assert_eq!(cfg.mcp_servers[0].args.len(), 3);
+        assert_eq!(cfg.mcp_servers[0].env.get("FOO").map(String::as_str), Some("bar"));
+    }
+
+    #[test]
+    fn tool_policy_defaults_to_unrestricted() {
+        let p = AgentConfig::default().tool_policy;
+        assert!(p.default_allow);
+        assert!(p.deny.is_empty());
+        assert!(p.bash_allowed_prefixes.is_empty());
+    }
+
+    #[test]
+    fn tool_policy_parses_from_toml() {
+        let toml = r#"
+provider = "openai"
+
+[tool_policy]
+default_allow = true
+deny = ["bash"]
+bash_allowed_prefixes = ["ls", "git "]
+"#;
+        let cfg: AgentConfig = Figment::from(Serialized::defaults(AgentConfig::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .expect("parse tool_policy");
+        assert!(cfg.tool_policy.default_allow);
+        assert_eq!(cfg.tool_policy.deny, vec!["bash".to_string()]);
+        assert_eq!(cfg.tool_policy.bash_allowed_prefixes.len(), 2);
     }
 }

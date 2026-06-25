@@ -1,0 +1,18 @@
+[package]
+name = "agent-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Minimal MCP (Model Context Protocol) client — connects to MCP servers over stdio and exposes their tools as agent-core Tools."
+
+[dependencies]
+agent-core  = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+thiserror   = { workspace = true }
+async-trait = { workspace = true }
+tokio       = { workspace = true }
+tracing     = { workspace = true }
