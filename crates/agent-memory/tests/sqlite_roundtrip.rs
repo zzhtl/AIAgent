@@ -85,3 +85,19 @@ async fn load_missing_session_errors() {
     let err = store.load_messages(&missing).await.err().unwrap();
     assert!(matches!(err, agent_core::SessionStoreError::NotFound(_)));
 }
+
+#[tokio::test]
+async fn ensure_external_session_is_idempotent_and_appendable() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let db = tmp.path().join("test.db");
+    let store = SqliteSessionStore::open(&db).await.unwrap();
+    let sid = agent_core::SessionId::from("external-session");
+
+    store.ensure_session(&sid, Some("external")).await.unwrap();
+    store.ensure_session(&sid, Some("ignored duplicate")).await.unwrap();
+    store.append_messages(&sid, &[Message::user("hello")]).await.unwrap();
+
+    let messages = store.load_messages(&sid).await.unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].text(), "hello");
+}

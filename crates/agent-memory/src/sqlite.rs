@@ -58,6 +58,26 @@ impl SqliteSessionStore {
 
         Ok(Self { pool })
     }
+
+    /// Ensure a session row exists for an *externally chosen* id (web/bot
+    /// session keys). `create_session` always mints its own uuid, so callers
+    /// that key sessions by caller-supplied strings need this before
+    /// `append_messages` (the messages table has a FK on sessions). No-op
+    /// when the row already exists.
+    pub async fn ensure_session(&self, sid: &SessionId, title: Option<&str>) -> StoreResult<()> {
+        let now = now_secs();
+        sqlx::query(
+            "INSERT OR IGNORE INTO sessions (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(sid.as_str())
+        .bind(title)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionStoreError::Backend(format!("ensure session: {e}")))?;
+        Ok(())
+    }
 }
 
 fn now_secs() -> i64 {

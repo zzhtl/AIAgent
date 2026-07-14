@@ -1,4 +1,5 @@
-//! Input/output adapter shared by CLI and bot front-ends.
+//! Streaming event model shared by every front-end, plus the (optional)
+//! bidirectional transport seam.
 
 use crate::message::{Message, StopReason, TokenUsage, ToolResult, ToolUse};
 use crate::Result;
@@ -50,7 +51,9 @@ pub enum AgentEvent {
 }
 
 /// Bidirectional adapter between a transport (terminal, IM, HTTP) and the
-/// agent runtime. CLI and bot implementations both implement this trait.
+/// agent runtime. Front-ends currently consume `Agent::run`'s event stream
+/// directly; this trait is the seam for symmetric transports (e.g. a future
+/// WebSocket channel) that push input and receive events over one connection.
 #[async_trait]
 pub trait Channel: Send + Sync {
     /// Pull the next user input. `None` signals the channel has closed and

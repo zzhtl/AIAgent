@@ -8,9 +8,10 @@
 //! single tool result, not the sub-agent's intermediate deltas, so the parent
 //! transcript stays clean.
 //!
-//! This module is a foundation skeleton: it is intentionally not wired into the
-//! CLI/bot yet. Cancellation propagation and recursion-depth guarding (via a
-//! counter in `ToolContext` extensions) are left for the multi-agent batch.
+//! Declared sub-agents (`[[subagents]]` in the config) are wired in at the
+//! application boundary (`agent-runtime`). Cancellation propagates from the
+//! parent's cancel flag, and recursion depth is guarded by [`SubAgentDepth`]
+//! carried through `ToolContext` extensions.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
