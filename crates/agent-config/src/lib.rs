@@ -60,6 +60,12 @@ pub struct AgentConfig {
     /// untrusted / multi-tenant deployments.
     #[serde(default)]
     pub tool_policy: ToolPolicyConfig,
+    /// Settings specific to the `agent-web` HTTP entry.
+    #[serde(default)]
+    pub web: WebConfig,
+    /// Settings specific to the `agent-bot` stdio entry.
+    #[serde(default)]
+    pub bot: BotConfig,
 }
 
 impl Default for AgentConfig {
@@ -75,8 +81,54 @@ impl Default for AgentConfig {
             subagents: Vec::new(),
             mcp_servers: Vec::new(),
             tool_policy: ToolPolicyConfig::default(),
+            web: WebConfig::default(),
+            bot: BotConfig::default(),
         }
     }
+}
+
+/// Settings for the `agent-web` HTTP/SSE entry.
+///
+/// The auth token is deliberately *not* a config key: secrets never live in
+/// config files. Set the `AGENT_WEB_TOKEN` environment variable instead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WebConfig {
+    /// Listen address. The legacy `AGENT_WEB_ADDR` env var, when set, still
+    /// takes precedence (handled by the app, not this loader).
+    pub addr: String,
+    /// Permit binding a non-loopback address without `AGENT_WEB_TOKEN`.
+    /// Off by default: exposing an unauthenticated agent endpoint is opt-in.
+    pub allow_unauthenticated: bool,
+    /// Persist per-session transcripts to the shared `sessions.db` so they
+    /// survive restarts. Off by default (in-process memory only).
+    pub persist_sessions: bool,
+    /// Tool permissions for web-served runs. When absent, a conservative
+    /// read-only profile applies (NOT the global `[permissions]`, whose
+    /// all-allow default exists for local CLI ergonomics).
+    pub permissions: Option<PermissionsConfig>,
+    /// Overrides the global `[tool_policy]` for web-served runs when set.
+    pub tool_policy: Option<ToolPolicyConfig>,
+}
+
+impl Default for WebConfig {
+    fn default() -> Self {
+        Self {
+            addr: "127.0.0.1:8787".into(),
+            allow_unauthenticated: false,
+            persist_sessions: false,
+            permissions: None,
+            tool_policy: None,
+        }
+    }
+}
+
+/// Settings for the `agent-bot` stdio entry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BotConfig {
+    /// Persist per-session transcripts to the shared `sessions.db`.
+    pub persist_sessions: bool,
 }
 
 /// Tool access policy (sandbox). `default_allow` governs tools not named in
@@ -256,7 +308,14 @@ impl AgentConfig {
             figment = figment.merge(Toml::file(&local));
         }
 
-        figment = figment.merge(Env::prefixed("AGENT_").split("__"));
+        // Legacy single-underscore vars documented for the web/bot binaries
+        // (plus the web auth secret) would otherwise surface as unknown
+        // top-level keys and fail extraction under `deny_unknown_fields`.
+        figment = figment.merge(
+            Env::prefixed("AGENT_")
+                .ignore(&["WEB_ADDR", "WEB_MODEL", "BOT_MODEL", "WEB_TOKEN"])
+                .split("__"),
+        );
 
         let mut cfg: AgentConfig = figment
             .extract()
@@ -389,5 +448,80 @@ bash_allowed_prefixes = ["ls", "git "]
         assert!(cfg.tool_policy.default_allow);
         assert_eq!(cfg.tool_policy.deny, vec!["bash".to_string()]);
         assert_eq!(cfg.tool_policy.bash_allowed_prefixes.len(), 2);
+    }
+
+    #[test]
+    fn web_and_bot_sections_default_and_parse() {
+        let cfg = AgentConfig::default();
+        assert_eq!(cfg.web.addr, "127.0.0.1:8787");
+        assert!(!cfg.web.allow_unauthenticated);
+        assert!(!cfg.web.persist_sessions);
+        assert!(cfg.web.permissions.is_none());
+        assert!(cfg.web.tool_policy.is_none());
+        assert!(!cfg.bot.persist_sessions);
+
+        let toml = r#"
+[web]
+addr = "0.0.0.0:9000"
+allow_unauthenticated = true
+persist_sessions = true
+
+[web.permissions]
+allow_shell = false
+allow_write = false
+
+[web.tool_policy]
+deny = ["bash"]
+
+[bot]
+persist_sessions = true
+"#;
+        let cfg: AgentConfig = Figment::from(Serialized::defaults(AgentConfig::default()))
+            .merge(Toml::string(toml))
+            .extract()
+            .expect("parse web/bot");
+        assert_eq!(cfg.web.addr, "0.0.0.0:9000");
+        assert!(cfg.web.allow_unauthenticated);
+        assert!(cfg.web.persist_sessions);
+        let perms = cfg.web.permissions.expect("web permissions");
+        assert!(!perms.allow_shell);
+        assert!(!perms.allow_write);
+        assert!(perms.allow_read); // unspecified fields keep their defaults
+        assert_eq!(cfg.web.tool_policy.expect("web policy").deny, vec!["bash".to_string()]);
+        assert!(cfg.bot.persist_sessions);
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // `figment::Jail` fixes the closure error type.
+    fn legacy_single_underscore_env_vars_do_not_break_load() {
+        figment::Jail::expect_with(|jail| {
+            let dir = jail.directory().to_string_lossy().to_string();
+            jail.set_env("HOME", &dir);
+            jail.set_env("XDG_CONFIG_HOME", &dir);
+            // The documented per-binary overrides plus the web auth secret:
+            // they must be ignored by the loader, not break it.
+            jail.set_env("AGENT_WEB_ADDR", "0.0.0.0:9999");
+            jail.set_env("AGENT_WEB_MODEL", "gpt-4o");
+            jail.set_env("AGENT_BOT_MODEL", "gpt-4o");
+            jail.set_env("AGENT_WEB_TOKEN", "secret");
+            let cfg = AgentConfig::load(None).map_err(|e| e.to_string())?;
+            // The ignored vars must not leak into config either.
+            assert_eq!(cfg.web.addr, "127.0.0.1:8787");
+            Ok(())
+        });
+    }
+
+    #[test]
+    #[allow(clippy::result_large_err)] // `figment::Jail` fixes the closure error type.
+    fn double_underscore_env_vars_reach_web_section() {
+        figment::Jail::expect_with(|jail| {
+            let dir = jail.directory().to_string_lossy().to_string();
+            jail.set_env("HOME", &dir);
+            jail.set_env("XDG_CONFIG_HOME", &dir);
+            jail.set_env("AGENT_WEB__ADDR", "127.0.0.1:9001");
+            let cfg = AgentConfig::load(None).map_err(|e| e.to_string())?;
+            assert_eq!(cfg.web.addr, "127.0.0.1:9001");
+            Ok(())
+        });
     }
 }

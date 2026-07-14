@@ -10,6 +10,7 @@ members = [
     "crates/agent-config",
     "crates/agent-telemetry",
     "crates/agent-mcp",
+    "crates/agent-runtime",
     "apps/agent-cli",
     "apps/agent-bot",
     "apps/agent-web",
@@ -34,6 +35,7 @@ agent-config    = { path = "crates/agent-config" }
 agent-telemetry = { path = "crates/agent-telemetry" }
 agent-evolution = { path = "crates/agent-evolution" }
 agent-mcp       = { path = "crates/agent-mcp" }
+agent-runtime   = { path = "crates/agent-runtime" }
 
 # 异步运行时与流
 tokio        = { version = "1", features = ["full"] }

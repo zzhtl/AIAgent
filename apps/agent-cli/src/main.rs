@@ -8,27 +8,18 @@ use clap::{Parser, Subcommand};
 use futures::StreamExt;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
-use agent_config::{AgentConfig, McpServerConfig, SubAgentConfig, ToolPolicyConfig};
-use agent_mcp::{McpClient, McpTool};
-use agent_tools::policy::{PolicyHook, ToolAccess, ToolPolicy};
-use agent_core::agent::RunConfig;
+use agent_config::AgentConfig;
 use agent_core::evolution::{CandidateKind, CandidateQueue};
 use agent_core::{
-    Agent, AgentEvent, ChainedPromptProvider, FactId, FactKind, FactStore, LlmProvider, Message,
-    NewFact, PromptProvider, SessionId, SessionStore, StopReason, SubAgentTool, TokenUsage,
-    ToolRegistry, UserInput,
+    Agent, AgentEvent, FactId, FactKind, FactStore, Message, NewFact, SessionId, SessionStore,
+    StopReason, TokenUsage, UserInput,
 };
 use agent_evolution::{Extractor, Reflector, Summariser};
 use agent_core::memory::{EmbeddingProvider, VectorStore};
-use agent_llm::providers::anthropic::{AnthropicConfig, AnthropicProvider};
-use agent_llm::providers::openai::{OpenAiConfig, OpenAiProvider};
-use agent_llm::ProviderRegistry;
 use agent_llm::providers::openai_embeddings::OpenAiEmbeddingProvider;
-use agent_memory::{
-    FactsPromptProvider, MarkdownFactStore, SimpleVectorStore, SqliteSessionStore,
-    VectorRecallPromptProvider,
-};
-use agent_skills::{Augmenter, RuleSet, SkillRegistry};
+use agent_memory::{MarkdownFactStore, SimpleVectorStore, SqliteSessionStore};
+use agent_runtime::{build_runtime, resolve_provider, BuildOptions};
+use agent_skills::{RuleSet, SkillRegistry};
 
 #[derive(Parser)]
 #[command(name = "agent", version, about = "AI Agent CLI", long_about = None)]
@@ -71,7 +62,7 @@ struct EffectiveCli {
 
 impl EffectiveCli {
     fn from(cli: &Cli) -> Result<Self> {
-        let config = AgentConfig::load(cli.config_dir.as_deref())
+        let mut config = AgentConfig::load(cli.config_dir.as_deref())
             .map_err(|e| anyhow!("config: {e}"))?;
         let provider = cli
             .provider
@@ -84,6 +75,7 @@ impl EffectiveCli {
             .config_dir
             .clone()
             .unwrap_or_else(|| config.config_dir());
+        config.config_dir = Some(config_dir.clone());
         Ok(Self { provider, model, no_tools, evolve, config_dir, config })
     }
 }
@@ -291,10 +283,26 @@ allow_shell = true
 allow_network = true
 max_runtime_secs = 120      # bash 等长任务的硬超时（秒）
 
+[web]
+addr = "127.0.0.1:8787"
+allow_unauthenticated = false  # 无 token 时禁止绑定非 loopback 地址
+persist_sessions = false
+# [web.permissions]             # 缺省为只读安全档；写出本节即完整覆盖
+# allow_read = true
+# allow_write = false
+# allow_shell = false
+# allow_network = false
+# max_runtime_secs = 60
+# [web.tool_policy]             # 可选；缺省沿用全局 [tool_policy]
+
+[bot]
+persist_sessions = false
+
 # API key（按所选 provider 设置对应环境变量，不要写进本文件）：
 #   openai   → export OPENAI_API_KEY=...
 #   deepseek → export DEEPSEEK_API_KEY=...
 #   claude   → export ANTHROPIC_API_KEY=...
+# Web 鉴权 token 只允许放环境变量：export AGENT_WEB_TOKEN=...
 
 # 子 agent（可选）：声明后会作为工具暴露给主 agent，由主 agent 自行决定何时委派。
 # 每个子 agent 复用主 provider、继承权限，但可独立设置 model / 系统提示 / 步数上限。
@@ -665,36 +673,8 @@ async fn cmd_memory_index(eff: &EffectiveCli, fact_store: Arc<dyn FactStore>) ->
     Ok(())
 }
 
-/// 构造可选的 `VectorRecallPromptProvider`：仅在 `OPENAI_API_KEY` 可用且
-/// 向量表非空时返回 `Some`，否则返回 `None`（语义召回静默跳过，不破坏正常聊天）。
-async fn build_vector_recall(
-    eff: &EffectiveCli,
-) -> Result<Option<Arc<dyn PromptProvider>>> {
-    let Ok(key) = std::env::var("OPENAI_API_KEY") else {
-        return Ok(None);
-    };
-    let embedder: Arc<dyn EmbeddingProvider> = Arc::new(
-        OpenAiEmbeddingProvider::new(key).map_err(|e| anyhow!("embedder init: {e}"))?,
-    );
-    let store = open_session_store_concrete(eff).await?;
-    let vectors: Arc<dyn VectorStore> = Arc::new(SimpleVectorStore::from_session_store(&store));
-    if vectors.is_empty().await.unwrap_or(true) {
-        return Ok(None);
-    }
-    let provider = VectorRecallPromptProvider::new(embedder, vectors)
-        .with_top_k(eff.config.agent.vector_recall_top_k)
-        .with_min_score(eff.config.agent.vector_recall_min_score);
-    Ok(Some(Arc::new(provider)))
-}
-
 async fn open_session_store_concrete(eff: &EffectiveCli) -> Result<SqliteSessionStore> {
-    let config_dir = eff.config_dir.clone();
-    std::fs::create_dir_all(&config_dir)
-        .with_context(|| format!("create_dir_all {}", config_dir.display()))?;
-    let db_path = config_dir.join("sessions.db");
-    SqliteSessionStore::open(&db_path)
-        .await
-        .map_err(|e| anyhow!("open sessions.db: {e}"))
+    agent_runtime::open_session_store(&eff.config_dir).await
 }
 
 async fn cmd_evolution(eff: &EffectiveCli, action: EvolutionCmd) -> Result<()> {
@@ -757,7 +737,9 @@ async fn cmd_evolution(eff: &EffectiveCli, action: EvolutionCmd) -> Result<()> {
             }
         }
         EvolutionCmd::Extract => {
-            let (provider, model) = build_provider(eff)?;
+            let resolved = resolve_provider(&eff.config, &runtime_options(eff))?;
+            let provider = resolved.provider;
+            let model = resolved.model;
             let fact_store: Arc<dyn FactStore> =
                 Arc::new(MarkdownFactStore::open(config_dir.join("memory")));
             let candidates = Extractor::new(provider, model, fact_store).extract().await;
@@ -1018,268 +1000,42 @@ struct AgentBundle {
 }
 
 async fn build_bundle(eff: &EffectiveCli) -> Result<AgentBundle> {
-    let (provider, model) = build_provider(eff)?;
-    let mut tools = ToolRegistry::new();
-    if !eff.no_tools {
-        agent_tools::register_builtins(&mut tools);
-        agent_tools::register_memory_tools(&mut tools);
-        agent_tools::register_evolution_tools(&mut tools);
-        // Register declared sub-agents as callable tools. Each reuses the main
-        // provider but gets its own model / system prompt; its tool-set is the
-        // built-ins only (no nested sub-agents), so the call graph can't recurse.
-        for sub in &eff.config.subagents {
-            let sub_agent = build_subagent(eff, &provider, &model, sub)?;
-            tools.register(Arc::new(SubAgentTool::new(
-                sub.name.clone(),
-                sub.description.clone(),
-                sub_agent,
-            )));
-        }
-        // Connect declared MCP servers and register their tools (namespaced by
-        // server name). A server that fails to start is logged and skipped so
-        // one bad entry doesn't abort startup.
-        for srv in &eff.config.mcp_servers {
-            match register_mcp_server(&mut tools, srv).await {
-                Ok(n) => tracing::info!("mcp `{}`: registered {n} tool(s)", srv.name),
-                Err(e) => eprintln!("[warning] mcp server `{}` skipped: {e}", srv.name),
-            }
-        }
+    let runtime = build_runtime(&eff.config, runtime_options(eff)).await?;
+    for warning in &runtime.warnings {
+        eprintln!("[warning] {warning}");
     }
-
-    let config_dir = eff.config_dir.clone();
-    std::fs::create_dir_all(&config_dir)
-        .with_context(|| format!("create_dir_all {}", config_dir.display()))?;
-
-    let skills = SkillRegistry::load_dir(&config_dir.join("skills"))
-        .map_err(|e| anyhow!("skills: {e}"))?;
-    let rules = RuleSet::load_dir(&config_dir.join("rules"))
-        .map_err(|e| anyhow!("rules: {e}"))?;
-    let augmenter = Augmenter::new(rules, skills);
-
-    let fact_store: Arc<dyn FactStore> =
-        Arc::new(MarkdownFactStore::open(config_dir.join("memory")));
-    let facts_provider = FactsPromptProvider::new(fact_store.clone());
-
-    let mut chain = ChainedPromptProvider::new();
-    if !augmenter.is_empty() {
-        chain.push(Arc::new(augmenter));
-    }
-    chain.push(Arc::new(facts_provider));
-
-    // 语义召回（可选）：开启后每轮先 embed 用户输入，再从 SQLite 向量表
-    // 拉 top-k 注入到 system prompt。需要先跑 `agent memory index`。
-    if eff.config.agent.vector_recall {
-        match build_vector_recall(eff).await {
-            Ok(Some(provider)) => chain.push(provider),
-            Ok(None) => {
-                eprintln!(
-                    "[note] vector_recall enabled but skipped (vector store empty or embedder unavailable; run `agent memory index` and set OPENAI_API_KEY)"
-                );
-            }
-            Err(e) => eprintln!("[warning] vector_recall init failed: {e}"),
-        }
-    }
-
-    let candidate_queue = open_candidate_queue(&config_dir);
-
-    let run_config = RunConfig {
-        max_steps: eff.config.agent.max_steps,
-        temperature: eff.config.agent.temperature,
-        max_tokens: eff.config.agent.max_tokens,
-        permissions: eff.config.permissions.to_runtime(),
-        max_retries: eff.config.agent.max_retries,
-        retry_base_delay_ms: eff.config.agent.retry_base_delay_ms,
-        token_budget: eff.config.agent.token_budget,
-    };
-
-    let mut builder = Agent::builder()
-        .with_llm(provider.clone())
-        .with_model(model.clone())
-        .with_tools(tools)
-        .with_fact_store(fact_store.clone())
-        .with_candidate_queue(candidate_queue)
-        .with_config(run_config)
-        .with_workspace(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    if !chain.is_empty() {
-        let provider_arc: Arc<dyn PromptProvider> = Arc::new(chain);
-        builder = builder.with_prompt_provider(provider_arc);
-    }
-    // Install the tool-access policy as a before_tool hook, but only when it
-    // actually restricts something (zero overhead otherwise).
-    let policy = tool_policy_from_config(&eff.config.tool_policy);
-    if !policy.is_unrestricted() {
-        builder = builder.with_hook(Arc::new(PolicyHook::new(policy)));
-    }
-    let agent = builder.build().map_err(|e| anyhow!("agent builder: {e}"))?;
-
-    let reflector = if eff.evolve {
-        Some(Reflector::new(provider.clone(), model.clone(), fact_store.clone()))
-    } else {
-        None
-    };
-
-    let summary_threshold = eff.config.agent.summary_threshold;
-    let summary_keep_tail = eff.config.agent.summary_keep_tail.max(1);
-    let summariser = if summary_threshold > 0 {
-        Some(Summariser::new(provider, model.clone()))
-    } else {
-        None
-    };
-
+    let reflector = runtime.reflector();
+    let summariser = runtime.summariser();
+    let summary_threshold = runtime.summary_threshold();
+    let summary_keep_tail = runtime.summary_keep_tail();
+    let evolve = runtime.evolve_enabled();
     let session_store = open_session_store(eff).await?;
 
     Ok(AgentBundle {
-        agent,
+        agent: runtime.agent,
         session_store,
         reflector,
         summariser,
         summary_threshold,
         summary_keep_tail,
-        evolve: eff.evolve,
-        model,
+        evolve,
+        model: runtime.model,
     })
 }
 
-/// Build one declared sub-agent: reuses the main provider, inherits the main
-/// permissions/workspace, but takes its own model / system prompt / step cap.
-/// Its tool-set is the built-ins only — no memory, evolution, or nested
-/// sub-agent tools — so it stays focused and the call graph cannot recurse.
-fn build_subagent(
-    eff: &EffectiveCli,
-    provider: &Arc<dyn LlmProvider>,
-    main_model: &str,
-    sub: &SubAgentConfig,
-) -> Result<Agent> {
-    let mut sub_tools = ToolRegistry::new();
-    agent_tools::register_builtins(&mut sub_tools);
-
-    let run_config = RunConfig {
-        max_steps: sub.max_steps.unwrap_or(eff.config.agent.max_steps),
-        permissions: eff.config.permissions.to_runtime(),
-        ..RunConfig::default()
-    };
-
-    let mut builder = Agent::builder()
-        .with_llm(provider.clone())
-        .with_model(sub.model.clone().unwrap_or_else(|| main_model.to_string()))
-        .with_tools(sub_tools)
-        .with_config(run_config)
-        .with_workspace(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    if let Some(p) = &sub.prompt {
-        builder = builder.with_system_prompt(p.clone());
-    }
-    builder.build().map_err(|e| anyhow!("subagent `{}`: {e}", sub.name))
-}
-
-/// Translate the declarative `[tool_policy]` config into a runtime `ToolPolicy`.
-fn tool_policy_from_config(cfg: &ToolPolicyConfig) -> ToolPolicy {
-    let default = if cfg.default_allow { ToolAccess::Allow } else { ToolAccess::Deny };
-    let mut policy =
-        ToolPolicy::new(default).with_bash_allowed_prefixes(cfg.bash_allowed_prefixes.clone());
-    for t in &cfg.deny {
-        policy = policy.deny(t.clone());
-    }
-    for t in &cfg.allow {
-        policy = policy.allow(t.clone());
-    }
-    policy
-}
-
-/// Connect one MCP server over stdio, list its tools, and register each as a
-/// namespaced `McpTool` (`<server>__<tool>`). Returns the number registered.
-async fn register_mcp_server(tools: &mut ToolRegistry, srv: &McpServerConfig) -> Result<usize> {
-    let env: Vec<(String, String)> =
-        srv.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-    let client = McpClient::connect_stdio(&srv.command, &srv.args, &env)
-        .await
-        .map_err(|e| anyhow!("connect: {e}"))?;
-    let defs = client.list_tools().await.map_err(|e| anyhow!("list_tools: {e}"))?;
-    let count = defs.len();
-    for def in defs {
-        let exposed = format!("{}__{}", srv.name, def.name);
-        tools.register(Arc::new(McpTool::new(
-            client.clone(),
-            exposed,
-            def.name,
-            def.description,
-            def.input_schema,
-        )));
-    }
-    Ok(count)
-}
-
-fn build_provider(eff: &EffectiveCli) -> Result<(Arc<dyn LlmProvider>, String)> {
-    let provider_id = eff.provider.to_ascii_lowercase();
-
-    // Resolve the provider through a registry of lazy factories: only the
-    // selected provider is constructed, so only its API key must be present.
-    // This is the seam for registering additional providers later.
-    let mut registry = ProviderRegistry::new();
-    register_builtin_providers(&mut registry);
-
-    let provider = registry
-        .build(&provider_id)
-        .ok_or_else(|| {
-            anyhow!(
-                "unsupported provider `{provider_id}` (expected `openai`, `deepseek`, or `claude`)"
-            )
-        })?
-        .map_err(|e| anyhow!("{e}"))?;
-
-    let model = eff
-        .model
-        .clone()
-        .unwrap_or_else(|| default_model_for(&provider_id).to_string());
-
-    Ok((provider, model))
-}
-
-/// Register the built-in providers as lazy factories. Each reads its API key
-/// from the environment only when selected; the error wording matches the
-/// previous hard-coded branches exactly.
-fn register_builtin_providers(registry: &mut ProviderRegistry) {
-    registry.register_factory("openai", || {
-        let key =
-            std::env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY is not set".to_string())?;
-        let p = OpenAiProvider::new(OpenAiConfig::openai(key))
-            .map_err(|e| format!("provider init: {e}"))?;
-        Ok(Arc::new(p) as Arc<dyn LlmProvider>)
-    });
-    registry.register_factory("deepseek", || {
-        let key = std::env::var("DEEPSEEK_API_KEY")
-            .map_err(|_| "DEEPSEEK_API_KEY is not set".to_string())?;
-        let p = OpenAiProvider::new(OpenAiConfig::deepseek(key))
-            .map_err(|e| format!("provider init: {e}"))?;
-        Ok(Arc::new(p) as Arc<dyn LlmProvider>)
-    });
-    for name in ["claude", "anthropic"] {
-        registry.register_factory(name, || {
-            let key = std::env::var("ANTHROPIC_API_KEY")
-                .map_err(|_| "ANTHROPIC_API_KEY is not set".to_string())?;
-            let p = AnthropicProvider::new(AnthropicConfig::new(key))
-                .map_err(|e| format!("provider init: {e}"))?;
-            Ok(Arc::new(p) as Arc<dyn LlmProvider>)
-        });
-    }
-}
-
-/// Provider-specific default model when the user didn't pin one with `--model`.
-fn default_model_for(provider_id: &str) -> &'static str {
-    match provider_id {
-        "deepseek" => "deepseek-chat",
-        "claude" | "anthropic" => "claude-sonnet-4-5",
-        _ => "gpt-4o-mini",
+fn runtime_options(eff: &EffectiveCli) -> BuildOptions {
+    BuildOptions {
+        provider_override: Some(eff.provider.clone()),
+        model_override: eff.model.clone(),
+        no_tools: eff.no_tools,
+        evolve: eff.evolve,
+        workspace: Some(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+        ..BuildOptions::default()
     }
 }
 
 async fn open_session_store(eff: &EffectiveCli) -> Result<Arc<dyn SessionStore>> {
-    let config_dir = eff.config_dir.clone();
-    std::fs::create_dir_all(&config_dir)
-        .with_context(|| format!("create_dir_all {}", config_dir.display()))?;
-    let db_path = config_dir.join("sessions.db");
-    let store = SqliteSessionStore::open(&db_path)
-        .await
-        .map_err(|e| anyhow!("open sessions.db: {e}"))?;
+    let store = agent_runtime::open_session_store(&eff.config_dir).await?;
     Ok(Arc::new(store))
 }
 

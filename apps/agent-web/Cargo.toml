@@ -14,10 +14,9 @@ path = "src/main.rs"
 
 [dependencies]
 agent-core      = { workspace = true }
-agent-llm       = { workspace = true }
-agent-tools     = { workspace = true }
-agent-skills    = { workspace = true }
 agent-memory    = { workspace = true }
+agent-config    = { workspace = true }
+agent-runtime   = { workspace = true }
 agent-telemetry = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true }
@@ -27,3 +26,10 @@ tracing      = { workspace = true }
 futures      = { workspace = true }
 async-stream = { workspace = true }
 axum         = { workspace = true }
+uuid         = { workspace = true }
+
+[dev-dependencies]
+async-trait   = { workspace = true }
+http-body-util = "0.1"
+tempfile       = "3"
+tower          = { version = "0.5", features = ["util"] }

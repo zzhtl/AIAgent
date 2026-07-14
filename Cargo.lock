@@ -6,16 +6,16 @@ version = 4
 name = "agent-bot"
 version = "0.1.0"
 dependencies = [
+ "agent-config",
  "agent-core",
- "agent-llm",
  "agent-memory",
- "agent-skills",
+ "agent-runtime",
  "agent-telemetry",
- "agent-tools",
  "anyhow",
  "futures",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -28,11 +28,10 @@ dependencies = [
  "agent-core",
  "agent-evolution",
  "agent-llm",
- "agent-mcp",
  "agent-memory",
+ "agent-runtime",
  "agent-skills",
  "agent-telemetry",
- "agent-tools",
  "anyhow",
  "chrono",
  "clap",
@@ -130,6 +129,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent-runtime"
+version = "0.1.0"
+dependencies = [
+ "agent-config",
+ "agent-core",
+ "agent-evolution",
+ "agent-llm",
+ "agent-mcp",
+ "agent-memory",
+ "agent-skills",
+ "agent-tools",
+ "anyhow",
+ "async-trait",
+ "futures",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "agent-skills"
 version = "0.1.0"
 dependencies = [
@@ -175,20 +195,24 @@ dependencies = [
 name = "agent-web"
 version = "0.1.0"
 dependencies = [
+ "agent-config",
  "agent-core",
- "agent-llm",
  "agent-memory",
- "agent-skills",
+ "agent-runtime",
  "agent-telemetry",
- "agent-tools",
  "anyhow",
  "async-stream",
+ "async-trait",
  "axum",
  "futures",
+ "http-body-util",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tower",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -692,8 +716,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8cb01cd46b0cf372153850f4c6c272d9cbea2da513e07538405148f95bd789f3"
 dependencies = [
  "atomic",
+ "parking_lot",
  "pear",
  "serde",
+ "tempfile",
  "toml",
  "uncased",
  "version_check",
