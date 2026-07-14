@@ -14,10 +14,12 @@ AIAgent/
 │   ├── agent-memory/      # 四层记忆：会话 / 事实 / 向量 / 摘要
 │   ├── agent-evolution/   # 自动进化：反思 / 规则提炼 / Skill 合成（半自动）
 │   ├── agent-config/      # 分层 TOML + env 配置
+│   ├── agent-runtime/     # 应用边界共享装配（依赖具体能力 crate）
 │   └── agent-telemetry/   # tracing 初始化 + token/费用统计
 └── apps/
     ├── agent-cli/         # CLI 入口（REPL + 一次性命令）
-    └── agent-bot/         # IM/Bot 接入占位
+    ├── agent-bot/         # stdio JSON 入口
+    └── agent-web/         # HTTP / SSE 入口
 ```
 
 ## 依赖方向
@@ -33,15 +35,41 @@ agent-llm  agent-tools  agent-skills  agent-memory  agent-config
                           │
                           ▼
               ┌───────────────────────┐
-              │   apps/agent-cli      │  agents/agent-bot
-              └───────────────────────┘
+              │     agent-runtime     │
+              └───────────┬───────────┘
+                          ▼
+                 CLI / bot / web apps
 ```
 
 **关键原则**
 
 - `agent-core` 不依赖任何具体 provider/tool/transport
-- 横向能力 crate（llm / tools / skills / memory / config / telemetry）互相独立，仅依赖 core
-- apps 层做组装与渲染，不放业务逻辑
+- 横向能力 crate（llm / tools / skills / memory / config / telemetry）保持 core 向外的依赖方向
+- `agent-runtime` 是唯一允许组合全部具体能力 crate 的可复用应用边界
+- apps 只处理参数、transport、会话生命周期与渲染，不复制 Agent 装配
+
+## 入口安全与会话并发
+
+- `agent-web` 的 `/health` 始终公开；`AGENT_WEB_TOKEN` 存在时，其余路由使用 Bearer 鉴权。
+- 无 token 时只允许 loopback 监听，除非显式设置 `web.allow_unauthenticated=true`。
+- web 未配置专属权限时使用只读安全档，不继承 CLI 面向本机使用的全开放默认值。
+- web 为每个 session 建立独立异步锁，锁从读取历史持续到 SSE `done` 折叠；同会话串行、异会话并发。省略 session 时由服务端生成 UUID。
+- bot 的 stdin 天然严格顺序，保留缺省 `"default"` 会话，不引入不必要的锁。
+- 两个入口均可通过 `persist_sessions=true` 复用 SQLite；持久化失败只告警，进程内会话继续运行。
+
+## 架构决策记录
+
+### ADR-008：共享装配位于 agent-runtime
+
+状态：已接受。core 保持无具体实现依赖，runtime 集中连接 provider、工具、MCP、子 agent、记忆与策略。代价是 web/bot 编译依赖增多，收益是三个入口不再发生能力和安全配置漂移。
+
+### ADR-009：Web 采用安全默认值
+
+状态：已接受。匿名访问仅限 loopback，非 loopback 需要 token 或显式不安全开关；工具缺省只读。该决定有意改变旧版 web 的全开放行为。
+
+### ADR-010：CandidateQueue 仅保证进程内写安全
+
+状态：已接受。clone 共享异步锁覆盖 read-modify-write，原子 rename 防止撕裂读；多个进程同时写同一 queue 文件仍不支持，暂不引入平台相关文件锁。
 
 ## 四大扩展点
 

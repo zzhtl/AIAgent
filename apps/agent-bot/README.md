@@ -32,17 +32,25 @@ stdio JSON 适配器 —— 任何 IM / 机器人平台都可以 spawn 本进程
 {"kind":"error","message":"invalid request: ..."}
 ```
 
-## 环境变量
+## 配置与环境变量
 
-- `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `DEEPSEEK_API_KEY`（按顺序探测）
+- 使用与 CLI 相同的分层 `config.toml`，包括 `[agent]`、`[permissions]`、
+  `[tool_policy]`、`[[subagents]]` 和 `[[mcp_servers]]`。
+- 配置的 provider 优先；缺少对应 key 时按 OpenAI → Anthropic → DeepSeek 探测。
 - `AGENT_BOT_MODEL`（可选，覆盖默认模型）
-- `AGENT_CONFIG_DIR`（默认 `~/.config/agent`）：从这里加载 skills / rules / memory
+- `AGENT_CONFIG_DIR`（默认 `~/.config/agent`）
+
+```toml
+[bot]
+persist_sessions = true  # 默认 false；开启后使用 <config_dir>/sessions.db
+```
 
 ## 状态
 
-- 进程内维护 `history`，所有 stdin 行共享同一对话上下文（关闭进程即清空）
-- 工具默认全开（file/shell/grep/glob/fetch + remember/recall + propose）
-- 暂不持久化 session 到 SQLite —— 如需跨进程持久化，调用方记录 transcript_delta 自行管理
+- 进程内按 `session` 隔离 history；缺省 session 保留为 `"default"`，适合单用户管道。
+- stdin 严格顺序处理，因此不存在 web 并发同会话的丢更新问题。
+- `persist_sessions=false` 时关闭进程即清空；设为 true 后重启可恢复。
+- 工具、权限与策略由共享 `agent-runtime` 装配，与 CLI 保持一致。
 
 ## 示例
 

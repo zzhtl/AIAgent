@@ -57,16 +57,22 @@ cargo run -p agent-cli -- chat
 
 可选：`cargo install --path apps/agent-cli` 后直接使用 `agent` 命令（下文示例均以 `agent` 代指该二进制）。
 
-Web 入口：
+Web 入口（默认仅监听 loopback，且工具权限为只读安全档）：
 
 ```bash
-# 启动 HTTP/SSE 服务（默认 127.0.0.1:8787，可用 AGENT_WEB_ADDR 覆盖）
+# loopback 本地开发可不设 token；对外监听必须设置 AGENT_WEB_TOKEN，
+# 或显式配置 web.allow_unauthenticated=true（不推荐）。
+export AGENT_WEB_TOKEN='replace-with-a-random-secret'
 cargo run -p agent-web
 
 curl -N -X POST localhost:8787/chat \
+  -H "authorization: Bearer $AGENT_WEB_TOKEN" \
   -H 'content-type: application/json' \
   -d '{"input":"你好","session":"u1"}'   # 返回一串 SSE 事件，以 done 结尾
 ```
+
+省略 `session` 时服务端生成 UUID，并先返回
+`{"kind":"session","session":"<uuid>"}`；客户端应保存该值供后续请求续话。
 
 ## CLI 命令
 
@@ -151,6 +157,28 @@ allow_shell = true
 allow_network = true
 max_runtime_secs = 120     # bash 等长任务的硬超时（秒）
 
+[web]
+addr = "127.0.0.1:8787"
+allow_unauthenticated = false  # 无 token 时，非 loopback 地址拒绝启动
+persist_sessions = false      # true 时复用 sessions.db，重启可续话
+
+# 缺少本节时 web 固定使用安全档：read=true，write/shell/network=false，60 秒。
+# 一旦写出本节，即视为完整显式覆盖（未写字段采用全局权限结构默认值）。
+# [web.permissions]
+# allow_read = true
+# allow_write = false
+# allow_shell = false
+# allow_network = false
+# max_runtime_secs = 60
+
+# 可选；缺省沿用全局 [tool_policy]。
+# [web.tool_policy]
+# default_allow = true
+# deny = ["bash"]
+
+[bot]
+persist_sessions = false      # true 时按请求 session 恢复 sessions.db 历史
+
 # 子 agent（可选）：声明后作为工具暴露给主 agent，由主 agent 自行委派。
 # 复用主 provider、继承权限，工具集仅内置工具（结构上不会递归）。
 # [[subagents]]
@@ -179,6 +207,10 @@ max_runtime_secs = 120     # bash 等长任务的硬超时（秒）
 ```
 
 加载顺序（后者覆盖前者）：内置默认 → `/etc/agent/config.toml` → `~/.config/agent/config.toml` → `./agent.toml` → `AGENT_*` 环境变量（双下划线分隔层级，如 `AGENT_AGENT__MAX_STEPS=20`）。
+
+`AGENT_WEB_TOKEN` 只从环境读取，不会进入配置对象。旧的单下划线变量
+`AGENT_WEB_ADDR`、`AGENT_WEB_MODEL`、`AGENT_BOT_MODEL` 仍保持最高优先级，
+但建议新部署使用配置文件（或 `AGENT_WEB__ADDR` 这类双下划线分层变量）。
 
 完整配置目录布局见 [`docs/architecture.md`](docs/architecture.md)。
 
@@ -211,7 +243,7 @@ tools_allowed:
 
 - **多 Agent**：在 `config.toml` 用 `[[subagents]]` 声明专精子 agent，它们会作为工具暴露给主 agent。主 agent 在一轮里调用多个子 agent 时**天然并发**（loop 并行派发工具）；REPL 内 Ctrl-C 的取消信号会**穿透到子 agent**；递归深度受 `max_depth`（默认 4）保护。
 - **MCP**：用 `[[mcp_servers]]` 声明 MCP server，启动时经 stdio 连接、`tools/list` 拉取并把工具注册进来（名字加 `<server>__<tool>` 前缀）。当前覆盖 stdio 传输 + `tools/list` / `tools/call`。
-- **Web**：`agent-web` 暴露 `GET /health` 与 `POST /chat`（SSE 流式 `AgentEvent`，`done` 事件结尾）；`session` 字段隔离进程内会话历史。
+- **Web**：`agent-web` 暴露公开的 `GET /health` 与 Bearer 保护的 `POST /chat`。同一 session 串行、不同 session 并发；客户端断开 SSE 会触发协作取消。缺省只读且只允许无鉴权 loopback 部署。
 
 ## 记忆与进化
 
@@ -238,6 +270,7 @@ crates/
   agent-evolution/   反思 / 摘要 / Extractor（规则·技能自动提炼）
   agent-config/      分层 TOML + env 配置
   agent-mcp/         MCP（Model Context Protocol）client：stdio JSON-RPC + McpTool
+  agent-runtime/     应用边界共享装配：config → provider/tools/memory/policy/Agent
   agent-telemetry/   tracing 初始化 + token/费用统计
 apps/
   agent-cli/         CLI 入口（REPL + 一次性命令）
